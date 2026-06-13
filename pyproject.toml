@@ -1,0 +1,48 @@
+[project]
+name = "dup-detector"
+version = "0.1.0"
+description = "Content-based duplicate/upgrade detector for video libraries — a zero-false-positive staged decision tree over independent signals"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "typer>=0.12",
+    "numpy>=1.26",
+    "xxhash>=3.4",
+    "pyyaml>=6.0",
+    "tqdm>=4.66",
+    # --- features / ML (install per your hardware; see requirements-gpu.txt) ---
+    # "torch",            # CUDA build for your GPU
+    # "torchvision",
+    # "faiss-gpu",        # or faiss-cpu if no GPU
+    # "faster-whisper",
+    # "av",               # PyAV (decode, NVDEC)
+    # (opencv for the live-view is in the [ui] extra)
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.4", "mypy>=1.10"]
+ui = ["PySide6>=6.7", "send2trash>=1.8", "opencv-python-headless>=4.8"]   # `dupdetect ui`: Qt app + live-view JPEG encode (cv2.imencode)
+# OPTIONAL: native filesystem events for the watcher (ReadDirectoryChangesW / inotify / FSEvents).
+# Without it the watcher still works via backoff polling; with it: instant reaction + minimal churn.
+watch = ["watchdog>=3.0"]
+
+[project.scripts]
+dupdetect = "dupdetect.cli:app"
+
+[tool.setuptools.package-data]
+"dupdetect.ui" = ["*.ico", "*.png"]   # the icon ships with the package (also in a non-editable install)
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true

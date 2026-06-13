@@ -1,0 +1,109 @@
+# Decision-tree thresholds. CALIBRATE against a hand-labeled set.
+# Goal: zero false positives in T1/T2, even if some borderline case falls to review.
+
+audio:
+  theta_a: 0.80          # strong-match threshold for aligned audio-fp
+  theta_a_low: 0.30      # below this: audio does NOT align (dub signal in T2)
+  min_overlap_s: 60      # minimum overlap seconds for the score to be considered valid
+  # DURATION-GATED fingerprint length (computed on-demand for candidate pairs, Pass-2):
+  #   duration <= fp_cap_above_s -> WHOLE file   (short content: series/AI-clips, where a 600s cap
+  #                                               is a dangerous fraction — shared intros alias
+  #                                               different episodes to ~0.94; whole-file is cheap
+  #                                               there, ~2s/min, and exposes divergent dialogue).
+  #   duration >  fp_cap_above_s -> fp_max_s cap  (movie giants: 600s is a safe <=17% head AND
+  #                                               whole-file fpcalc is ~13x the disk cost — measured
+  #                                               UHD remux 280s vs 22s capped).
+  # 600s still leaves >=300s overlap for alignment (searches +-max_offset_s=300s). The muted/cut-audio
+  # warning is unaffected (coverage is measured separately over the WHOLE file, seek-sampled).
+  # MEASURED 2026-06-12 (cross-episode pair, same series, 22min): capped-600 audio=0.94 -> whole-file 0.77 ->
+  # different episodes leave T1; real dups stay ~0.98. fp_max_s=0 disables capping (whole file always).
+  fp_max_s: 600
+  fp_cap_above_s: 3600   # gate (s): whole file at/below ~1h, cap above
+
+video:
+  theta_v: 0.75          # strong-match threshold for video embeddings (Chamfer/local-align)
+  theta_v_high: 0.85     # stricter threshold for T2 (cross-language)
+  min_coverage: 0.70     # fraction of the shorter one that must align (COV)
+  fps_sample: 2.0        # dense sampling (time doesn't matter)
+  # A3: DP banded Sakoe-Chiba. band = maximum plausible offset in frames.
+  max_offset_s: 300      # ±300 s of plausible offset (prepended ads/intro)
+  # band_radius (frames) = max_offset_s * fps_sample = 600 at 2 fps
+  embed_dtype_disk: "float16"   # A1: fp16 on disk (22 MB/film); CUDA tensor in cache
+
+scenes:
+  theta_s: 0.70          # aligned scene-cut signature (DTW)
+  theta_s_high: 0.80     # stricter threshold for T4 (cam rips, structure only)
+  # T4 (scenes ALONE) needs a discriminative cut signature. A coarse one — few cuts over a
+  # long runtime, typical of SEEK-sampled giants (~1.3 cuts/min) — aligns spuriously between
+  # unrelated dense films (measured ~0.88). Require a minimum cut density (cuts/s) on BOTH
+  # files before trusting scenes alone. Measured gap: SEEK <=0.022, demux >=0.077.
+  # T1/T2/T3 corroborate with video, so they are unaffected. TUNABLE.
+  min_cut_density: 0.04  # cuts/s (~2.4/min)
+
+edition:
+  # contiguous superset => different edition (director's cut), NOT a junk duplicate
+  superset_min_extra_ratio: 0.08   # >8% extra contiguous runtime => edition candidate
+
+retrieval:
+  faiss_k: 25            # candidates per query in the coarse stage
+  metric: "ip"           # inner product over L2-normalized vectors (== cosine)
+  # A2: multi-vector — K descriptors per temporal window in addition to mean-pool.
+  # Rescues cam rips and globals contaminated by prepended ads.
+  n_window_vecs: 12      # K descriptors per film (8-16); 0 = mean-pool only
+  window_faiss_k: 10     # candidates per window-vec
+  # A2: duration safety net — compares pairs of similar runtime. Measured on labeled dups: real
+  # duplicates have ~identical duration (27/28 within 1%); ±12% over a dense library exploded the
+  # candidate count (O(N^2): ~2262 neighbors/file -> ~17M pairs). Tightened to ±3% (keeps all
+  # labeled dups; the one 15.8% outlier is caught by embedding retrieval, not this net).
+  duration_tolerance: 0.03   # ±3% of duration_s
+  # Gate: only ALIGN duration-neighbors whose GLOBAL embedding cosine to the query >= this. Labeled
+  # dups are >=0.962 cosine, so 0.7 keeps them with wide margin while dropping the same-length-but-
+  # different videos that dominate a dense library. Prunes only the safety net; top-k/window retrieval
+  # are untouched. ~17M pairs -> ~626k (126h -> ~5h of align). 0 disables the gate.
+  duration_block_cos_gate: 0.7
+
+embeddings:
+  model: "dinov2_vitb14" # backbone; alternatives: dinov2_vitl14, CLIP, ViSiL weights
+  dim: 768
+  batch: 512
+
+sampling:
+  # Adaptive frame sampling by size. Files > seek_threshold_gb are sampled by sparse
+  # SEEK (PyAV jumps to seek_n timestamps); the rest, keyframe demux.
+  # Seek is ~constant (doesn't read the whole container) -> ~3x on giant 4K/8K; for HD
+  # demux is faster (per-jump overhead). See docs/HPC_PIPELINE.md.
+  seek_threshold_gb: 6.0
+  seek_n: 200
+  # Common temporal grid to align by TIME (not by index): makes the match robust
+  # between copies with different sampling (seek vs demux). Step in seconds.
+  grid_step_s: 2.0
+
+quality:
+  whisper_model: "base"  # language-detect only, not transcription
+  wanted_langs: ["spa", "eng"]   # desired languages; others => discard candidate
+  cam_score_flag: 0.60   # score above which a file is flagged as suspected cam
+  # Group copies by name: files differing only by (N) in the SAME folder
+  # (movie.avi / movie (1).avi) -> NAME_COPY cluster (probable). Content VETOES if it says
+  # DIFFERENT. Does not affect the zero-FP of the content tiers. true by default.
+  name_copy_grouping: true
+  # Color (latest stage, from the decoded keyframes). Clipping = destroyed detail -> the KEEP
+  # ranking prefers the LEAST-clipped copy (validated: original ~1% clipping vs bad auto color
+  # correction ~27%). Weight tiebreaks within a resolution without overriding a real resolution
+  # jump. The grade-divergence flag ('⚠ color differs — pick manually') is GRADE_DIVERGENCE in
+  # quality/color.py (UI-side). 0 disables the color signal in KEEP. TUNABLE.
+  color_clip_keep_weight: 1000000
+  # Inserted-commercials hint (like the color warning: never changes the duplicate verdict, only the
+  # KEEP suggestion + a UI flag). A copy is flagged as having ads when its INTERLEAVED extra runtime
+  # (foreign blocks spliced inside the aligned span, AlignResult.interleaved_ratio) >= this. Measured
+  # 2026-06-12: real dups/editions/different content = 0.0; injected mid-roll ads = the ad fraction,
+  # so 0.02 has zero false positives and catches a single ~2-min break in a 90-min movie. 0 disables.
+  ad_interleaved_min: 0.02
+  min_ad_run_s: 10       # min contiguous unmatched run (s) counted as an ad break (filters encode jitter)
+
+limits:
+  # PER-FILE timeouts: prevent a file with a broken/missing index (very slow seek) from
+  # wasting minutes. On exceeding them, the file is marked 'reindex' and SKIPPED (does not
+  # bring down the scan); the user can rebuild its index at the end (remux). See the UI tab
+  # "Indexes to rebuild". Legitimate giants use SEEK (fast) and never come close.
+  decode_timeout_s: 240      # keyframe decode of ONE file
+  audio_fp_timeout_s: 600    # fpcalc (reads the whole file; generous for 4K/8K)

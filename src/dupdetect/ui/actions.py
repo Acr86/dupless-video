@@ -1,0 +1,154 @@
+"""UI actions: open in VLC and delete files (to Trash / quarantine / permanent).
+Logic separated from Qt to keep it testable. KEEP never reaches here (filtered by the model)."""
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+from dataclasses import dataclass
+
+from dupdetect.store import FingerprintStore
+
+
+def find_vlc() -> str | None:
+    """Locates vlc.exe: DUPDETECT_VLC env var -> PATH -> typical Windows paths."""
+    env = os.environ.get("DUPDETECT_VLC")
+    if env and os.path.isfile(env):
+        return env
+    which = shutil.which("vlc")
+    if which:
+        return which
+    for p in (r"C:\Program Files\VideoLAN\VLC\vlc.exe",
+              r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe"):
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def open_in_vlc(path: str) -> None:
+    """Opens `path` in VLC; if VLC is not found, falls back to the OS default player."""
+    vlc = find_vlc()
+    if vlc:
+        subprocess.Popen([vlc, os.path.normpath(path)])
+    else:
+        os.startfile(os.path.normpath(path))            # type: ignore[attr-defined]  # Windows
+
+
+def find_brave() -> str | None:
+    """Locate brave.exe: DUPDETECT_BROWSER -> PATH -> typical Windows install paths."""
+    env = os.environ.get("DUPDETECT_BROWSER")
+    if env and os.path.isfile(env):
+        return env
+    which = shutil.which("brave")
+    if which:
+        return which
+    for p in (r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+              r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
+              os.path.expandvars(r"%LOCALAPPDATA%\BraveSoftware\Brave-Browser\Application\brave.exe")):
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def _private_flag(exe: str) -> str:
+    """'Private window' flag for the browser family (inferred from the exe name).
+    Firefox and Edge use their own flags; the rest (Brave/Chrome/Chromium/Vivaldi) are Chromium."""
+    name = os.path.basename(exe).lower()
+    if "firefox" in name:
+        return "-private-window"
+    if "msedge" in name or name == "edge.exe":
+        return "--inprivate"
+    if "opera" in name:
+        return "--private"
+    return "--incognito"                                 # brave, chrome, chromium, vivaldi…
+
+
+def _default_browser() -> str | None:
+    """Path to the user's default browser, read from the Windows registry (the user's https
+    choice). None if it can't be determined (non-Windows, missing key, odd ProgId)."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                r"SOFTWARE\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice") as k:
+            progid = winreg.QueryValueEx(k, "ProgId")[0]
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, progid + r"\shell\open\command") as k:
+            cmd = winreg.QueryValueEx(k, None)[0]         # e.g.  "C:\...\app.exe" -- "%1"
+    except (OSError, ImportError):
+        return None
+    import shlex
+    try:
+        exe = shlex.split(cmd, posix=False)[0].strip('"')  # exe = first token (quoted)
+    except ValueError:
+        return None
+    return exe if os.path.isfile(exe) else None
+
+
+def web_search(query: str) -> None:
+    """Opens a Google search for `query` in a PRIVATE WINDOW: Brave if installed, otherwise the
+    OS default browser (also private). Last resort if none is detected: default browser without
+    private mode (webbrowser). Only opens a normal web search."""
+    from urllib.parse import quote_plus
+    url = "https://www.google.com/search?q=" + quote_plus(query)
+    exe = find_brave() or _default_browser()
+    if exe:
+        subprocess.Popen([exe, _private_flag(exe), url])
+    else:
+        import webbrowser
+        webbrowser.open(url)                             # no private mode: no browser detected
+
+
+@dataclass
+class DeleteResult:
+    deleted: list[str]
+    errors: list[tuple[str, str]]                       # (path, message)
+    freed_bytes: int
+
+
+def delete_files(store: FingerprintStore, files: list[tuple[str, int]], dest: str = "trash",
+                 quarantine_dir: str | None = None) -> DeleteResult:
+    """Deletes `files` = [(path, size)]. `dest`: 'trash' (Recycle Bin) | 'quarantine' (move to
+    folder) | 'permanent'. After each deletion: audits it (`record_deletion`) and REMOVES it from
+    the index (`forget_file`: row + matches + cluster + .npy) to leave no ghosts. Must NEVER
+    receive a KEEP (the model blocks it)."""
+    from send2trash import send2trash
+
+    deleted: list[str] = []
+    errors: list[tuple[str, str]] = []
+    freed = 0
+    for path, size in files:
+        try:
+            if dest == "trash":
+                send2trash(os.path.normpath(path))
+            elif dest == "quarantine":
+                qd = quarantine_dir or os.path.join(os.path.dirname(path), ".dup_trash")
+                os.makedirs(qd, exist_ok=True)
+                shutil.move(path, os.path.join(qd, os.path.basename(path)))
+            else:                                       # permanent
+                os.remove(path)
+            store.record_deletion(path, dest, size)
+            store.forget_file(path)
+            deleted.append(path)
+            freed += int(size or 0)
+        except Exception as e:                          # noqa: BLE001
+            errors.append((path, str(e)))
+    if deleted:
+        # A cluster left with 1 file is no longer a duplicate group: prune it so
+        # it does not appear in the list (the remaining keep is intact in `files` and on disk).
+        store.prune_singleton_clusters()
+    return DeleteResult(deleted=deleted, errors=errors, freed_bytes=freed)
+
+
+def apply_thresholds(theta_v: float, theta_a: float, config_path: str | None = None) -> str:
+    """Writes the recalibrated thresholds to thresholds.yaml (only θv/θa, which is what
+    suggest_thresholds sweeps). Affects FUTURE scans, not already-completed detection. Returns the written path."""
+    import yaml
+
+    from dupdetect.config import DEFAULT_CONFIG
+    p = str(config_path or DEFAULT_CONFIG)
+    with open(p, encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+    raw["video"]["theta_v"] = float(theta_v)
+    raw["audio"]["theta_a"] = float(theta_a)
+    with open(p, "w", encoding="utf-8") as f:
+        yaml.safe_dump(raw, f, sort_keys=False, allow_unicode=True)
+    return p

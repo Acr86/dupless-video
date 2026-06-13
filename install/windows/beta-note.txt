@@ -1,0 +1,10 @@
+Dupless Video — BETA
+====================
+
+- This is a BETA. Take it easy.
+- It finds DUPLICATE videos by CONTENT (not by filename).
+- IMPORTANT: review before deleting. Deletions go to the Recycle Bin
+  (recoverable) — do NOT empty it until you have confirmed.
+- If it won't open or scan, run the diagnostic:
+      "Dupless Video.exe" --selftest
+  and share the file:  %LOCALAPPDATA%\Dupless Video\selftest.log

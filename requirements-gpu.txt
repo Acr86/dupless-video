@@ -1,0 +1,10 @@
+# Heavy GPU / ML stack. Install the CUDA build of torch for your card from pytorch.org
+# (e.g. a Blackwell card needs a CUDA 12.8+ build); the app falls back to CPU if CUDA is absent.
+torch
+torchvision
+faiss-gpu              # or faiss-cpu if you have no GPU
+opencv-python-headless # live-view JPEG encode (cv2.imencode); headless = no GUI libs, the app's UI is Qt
+faster-whisper
+av                     # PyAV: decode (ideally with NVDEC enabled)
+# Embeddings: DINOv2 via torch.hub, or:
+# transformers         # for CLIP/DINOv2 from Hugging Face if preferred

@@ -1,0 +1,78 @@
+# ---------------------------------------------------------------------------
+# dup-detector — what must NEVER be committed.
+# Ship ONLY source + clean config: no user data, no machine-specific paths,
+# no large downloaded artifacts (binaries/model weights), no caches/build output.
+#
+# NOTE: git does NOT support inline comments. A comment must be on its OWN line;
+# `pattern  # text` is read as a literal pattern and silently fails to match.
+# ---------------------------------------------------------------------------
+
+# --- User data & generated indexes (contain real library paths/filenames) ---
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+# per-DB memmapped .npy embeddings (sit next to the DB)
+embeddings/
+*.npy
+*.memmap
+# benchmark sets / labeled groups -> real filenames
+data/
+# scan reports -> real filenames
+reports/
+# run logs (e.g. dups_run.log)
+*.log
+labels.csv
+
+# --- Machine-specific / personal / local tooling ---
+# local install log: username, drive paths, GPU model
+INSTALL_RECORD.md
+# editor/assistant session config (allowlist holds machine-specific library paths) + local kickoff notes
+.claude/
+PROMPT_CLAUDE_CODE.md
+# local scratch: scan outputs / profiling -> real library paths
+_scan_test/
+
+# --- Shipped assets fetched/built per machine (NOT source) ---
+# ffmpeg/ffprobe/fpcalc vendored per build
+bundle/bin/
+# DINOv2 repo + weights (warmed locally)
+bundle/models/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# --- Virtualenvs ---
+.venv/
+.venv-build/
+venv/
+env/
+
+# --- Build / packaging output (PyInstaller, wheels, Inno Setup) ---
+build/
+dist/
+# auto-generated specs are ignored; the hand-written one is force-kept below
+*.spec
+!dupless-video.spec
+# Inno Setup default output dir
+Output/
+
+# --- Test / lint / type caches ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Editors / IDEs ---
+.vscode/
+.idea/
+*.swp
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+desktop.ini
