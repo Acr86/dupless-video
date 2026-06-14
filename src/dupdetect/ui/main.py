@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 
 from dupdetect import runtime
 from dupdetect.store import FingerprintStore
+from dupdetect import __version__
 from dupdetect.ui import actions, startup
 from dupdetect.ui.data import clean_title, drift_report, is_actionable, load_clusters, sort_clusters
 from dupdetect.ui.model import (
@@ -237,6 +238,10 @@ class MainWindow(QMainWindow):
         btn_recal.clicked.connect(self._recalibrate)
         self._coverage = QLabel("")                     # permanent badge: library analysis coverage
         self.statusBar().addPermanentWidget(self._coverage)
+        _ver = QLabel(f"v{__version__}")                # discreet version badge, bottom-right
+        _ver.setStyleSheet("color: gray;")
+        _ver.setToolTip("Dupless Video version")
+        self.statusBar().addPermanentWidget(_ver)
         self.refresh()
         QTimer.singleShot(0, self._maybe_onboard)       # one-time intro (after the window is shown)
         if startup.is_enabled() and self.watch_panel.folder.text().strip():
