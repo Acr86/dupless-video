@@ -1,4 +1,4 @@
-"""UI actions: open in VLC and delete files (to Trash / quarantine / permanent).
+"""UI actions: open in VLC and delete files (always to the system Trash — recoverable).
 Logic separated from Qt to keep it testable. KEEP never reaches here (filtered by the model)."""
 from __future__ import annotations
 
@@ -104,12 +104,12 @@ class DeleteResult:
     freed_bytes: int
 
 
-def delete_files(store: FingerprintStore, files: list[tuple[str, int]], dest: str = "trash",
-                 quarantine_dir: str | None = None) -> DeleteResult:
-    """Deletes `files` = [(path, size)]. `dest`: 'trash' (Recycle Bin) | 'quarantine' (move to
-    folder) | 'permanent'. After each deletion: audits it (`record_deletion`) and REMOVES it from
-    the index (`forget_file`: row + matches + cluster + .npy) to leave no ghosts. Must NEVER
-    receive a KEEP (the model blocks it)."""
+def delete_files(store: FingerprintStore, files: list[tuple[str, int]]) -> DeleteResult:
+    """Sends `files` = [(path, size)] to the system Trash (Recycle Bin on Windows, XDG Trash on
+    Linux, Trash on macOS) via send2trash — ALWAYS recoverable; this app never deletes permanently
+    (a dedupe tool must not be a one-click way to lose a file). After each: audits it
+    (`record_deletion`) and REMOVES it from the index (`forget_file`: row + matches + cluster + .npy)
+    so no ghost lingers. Must NEVER receive a KEEP (the model blocks it)."""
     from send2trash import send2trash
 
     deleted: list[str] = []
@@ -117,15 +117,8 @@ def delete_files(store: FingerprintStore, files: list[tuple[str, int]], dest: st
     freed = 0
     for path, size in files:
         try:
-            if dest == "trash":
-                send2trash(os.path.normpath(path))
-            elif dest == "quarantine":
-                qd = quarantine_dir or os.path.join(os.path.dirname(path), ".dup_trash")
-                os.makedirs(qd, exist_ok=True)
-                shutil.move(path, os.path.join(qd, os.path.basename(path)))
-            else:                                       # permanent
-                os.remove(path)
-            store.record_deletion(path, dest, size)
+            send2trash(os.path.normpath(path))
+            store.record_deletion(path, "trash", size)
             store.forget_file(path)
             deleted.append(path)
             freed += int(size or 0)

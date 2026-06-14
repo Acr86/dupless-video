@@ -42,7 +42,7 @@ def test_delete_files_prunes_and_preserves_keep(tmp_path, monkeypatch):
     s.save_cluster(0, str(disc), is_keep=False)
 
     monkeypatch.setattr("send2trash.send2trash", lambda p: None)   # don't touch the real Trash
-    res = actions.delete_files(s, [(str(disc), 10)], dest="trash")
+    res = actions.delete_files(s, [(str(disc), 10)])   # always to Trash (recoverable)
     assert res.deleted == [str(disc)]
     assert load_clusters(s) == []             # resolved pair is removed from the duplicates list
     assert keep.exists()                       # the KEEP is NOT deleted from disk

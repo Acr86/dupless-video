@@ -10,9 +10,9 @@ from pathlib import Path
 from PySide6.QtCore import QProcess, QProcessEnvironment, QSettings, Qt, QTimer
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QAbstractItemView, QApplication, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow, QMenu,
-    QMessageBox, QProgressBar, QPushButton, QRadioButton, QSystemTrayIcon, QTabWidget,
+    QMessageBox, QProgressBar, QPushButton, QSystemTrayIcon, QTabWidget,
     QTreeView, QVBoxLayout, QWidget,
 )
 
@@ -496,7 +496,7 @@ class MainWindow(QMainWindow):
 
     def _vlc_paths(self, paths: list[str]) -> None:
         if not paths:
-            self._toast("Check ☑ a video first to open it in VLC.")
+            _mbox(self, "Nothing checked", "Check ☑ a video first to open it in VLC.")
             return
         for p in paths[:8]:                              # cap to avoid opening dozens of windows
             actions.open_in_vlc(p)
@@ -506,7 +506,7 @@ class MainWindow(QMainWindow):
         It's just a normal web search to help you locate/re-acquire the title on your own."""
         paths = self._checked_problem_paths(model)
         if not paths:
-            self._toast("Check ☑ a file first to search it on Google.")
+            _mbox(self, "Nothing checked", "Check ☑ a file first to search it on Google.")
             return
         for p in paths[:6]:                              # cap: don't open dozens of tabs
             actions.web_search(clean_title(p))
@@ -521,7 +521,7 @@ class MainWindow(QMainWindow):
         else:
             src = [(p, (note or err or "")) for p, err, _cat, note in self.store.problems(category=kind)]
         if not src:
-            self._toast("Nothing to export in this tab.")
+            _mbox(self, "Export", "Nothing to export in this tab.")
             return
         fn, _ = QFileDialog.getSaveFileName(self, "Export list", f"{kind}_list.csv",
                                             "CSV (*.csv);;JSON (*.json)")
@@ -548,7 +548,7 @@ class MainWindow(QMainWindow):
         """Sends files from the reindex/corrupt tabs to the Recycle Bin (they are not in clusters):
         send2trash + clears their problem record. Same behaviour as deleting duplicates."""
         if not paths:
-            self._toast("Check ☑ the videos you want to delete.")
+            _mbox(self, "Nothing checked", "Check ☑ the videos you want to delete.")
             return
         if _mbox(
                 self, "Delete",
@@ -603,13 +603,12 @@ class MainWindow(QMainWindow):
     def _delete_selected(self):
         files = checked_files(self.model)
         if not files:
-            self._toast("Check the files to delete (the KEEP ★ can't be).")
+            _mbox(self, "Nothing selected", "Check the files to delete (the KEEP ★ can't be).")
             return
         dlg = _ConfirmDelete(self, files)
         if dlg.exec() != QDialog.Accepted:
             return
-        res = actions.delete_files(self.store, files, dest=dlg.dest(),
-                                   quarantine_dir=None)
+        res = actions.delete_files(self.store, files)
         msg = f"Deleted {len(res.deleted)} · freed {_gb(res.freed_bytes)}"
         if res.errors:
             msg += f"\n{len(res.errors)} errors:\n" + "\n".join(f"· {p}: {e}" for p, e in res.errors[:8])
@@ -788,7 +787,7 @@ class MainWindow(QMainWindow):
     def _open_folders(self, paths: list[str]) -> None:
         """Opens the folders of checked files in the file explorer (cap 8)."""
         if not paths:
-            self._toast("Check ☑ a video first to open its folder.")
+            _mbox(self, "Nothing checked", "Check ☑ a video first to open its folder.")
             return
         import subprocess
         for p in paths[:8]:
@@ -840,40 +839,25 @@ def _mbox(parent, title: str, text: str, buttons=QMessageBox.Ok, default=QMessag
 
 
 class _ConfirmDelete(QDialog):
-    """Confirmation dialog: lists EVERYTHING being deleted + total, and the destination."""
+    """Confirmation dialog: lists what will be sent to the Trash + total. Deletion is ALWAYS to the
+    system Trash (Recycle Bin) — recoverable; there is no permanent option (a dedupe tool must not be
+    a one-click way to lose a file)."""
     def __init__(self, parent, files: list[tuple[str, int]]):
         super().__init__(parent)
         self.setWindowTitle("Confirm deletion")
         self.resize(720, 420)
         total = sum(s for _, s in files)
         lay = QVBoxLayout(self)
-        lay.addWidget(QLabel(f"You are about to delete {len(files)} files · {_gb(total)}.  "
-                             "The KEEP ★ are NOT touched."))
+        lay.addWidget(QLabel(f"Send {len(files)} file(s) · {_gb(total)} to the Recycle Bin?  "
+                             "The KEEP ★ are NOT touched — you can restore these from the Trash."))
         lst = QListWidget()
         for path, size in files:
             lst.addItem(f"{_gb(size):>9}   {path}")
         lay.addWidget(lst)
-        self._trash = QRadioButton("Recycle Bin"); self._trash.setChecked(True)
-        self._quar = QRadioButton("Quarantine folder (.dup_trash)")
-        self._perm = QRadioButton("Delete permanently")
-        self._ack = QCheckBox("I understand this is irreversible")
-        for w in (self._trash, self._quar, self._perm, self._ack):
-            lay.addWidget(w)
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        bb.button(QDialogButtonBox.Ok).setText(f"Delete {len(files)} ({_gb(total)})")
-        bb.accepted.connect(self._accept); bb.rejected.connect(self.reject)
-        self._bb = bb
+        bb.button(QDialogButtonBox.Ok).setText(f"Send {len(files)} to Recycle Bin")
+        bb.accepted.connect(self.accept); bb.rejected.connect(self.reject)
         lay.addWidget(bb)
-
-    def dest(self) -> str:
-        return "trash" if self._trash.isChecked() else "quarantine" if self._quar.isChecked() else "permanent"
-
-    def _accept(self):
-        if self.dest() == "permanent" and not self._ack.isChecked():
-            _mbox(self, "Confirmation required",
-                                "Check 'I understand this is irreversible' to delete permanently.")
-            return
-        self.accept()
 
 
 _SINGLETON = "dupdetect-ui-singleton"

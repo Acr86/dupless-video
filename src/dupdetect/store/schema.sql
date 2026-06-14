@@ -98,7 +98,7 @@ CREATE TABLE IF NOT EXISTS feedback (
 -- Audit of deletions made from the UI (traceability / possible undo from Trash).
 CREATE TABLE IF NOT EXISTS deletions (
     path        TEXT NOT NULL,
-    dest        TEXT NOT NULL,         -- 'trash' | 'quarantine' | 'permanent'
+    dest        TEXT NOT NULL,         -- destination; always 'trash' (recoverable) in current builds
     size        INTEGER,
     deleted_at  REAL NOT NULL
 );
