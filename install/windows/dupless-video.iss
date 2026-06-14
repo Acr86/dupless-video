@@ -74,7 +74,7 @@ Name: "{userdesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: deskto
 ; (1) Run-at-login. ValueName matches startup.py (_APP_NAME="Dupless Video") so the in-app toggle and
 ; this installer task share ONE entry. uninsdeletevalue removes it on uninstall.
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; \
-    ValueName: "{#AppName}"; ValueData: """{app}\{#AppExeName}"""; Flags: uninsdeletevalue; \
+    ValueName: "{#AppName}"; ValueData: """{app}\{#AppExeName}"" --tray"; Flags: uninsdeletevalue; \
     Tasks: startupwithwindows
 
 [Run]

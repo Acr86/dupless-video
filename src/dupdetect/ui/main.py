@@ -866,7 +866,7 @@ class _ConfirmDelete(QDialog):
 _SINGLETON = "dupdetect-ui-singleton"
 
 
-def run(db_path: str) -> int:
+def run(db_path: str, start_hidden: bool = False) -> int:
     try:                                                # own identity in the taskbar
         import ctypes                                   # AUMID in Company.Product.Version format
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("DupDetector.VideoDedup.1")
@@ -907,5 +907,12 @@ def run(db_path: str) -> int:
 
     server.newConnection.connect(_focus)
     win._single_server = server                         # prevent GC of server
-    win.show()
+    # --tray (run-at-login): stay hidden in the tray, watching, instead of popping the window open.
+    # Fall back to showing the window if there is no system tray (so it can't get stuck invisible).
+    if start_hidden and win._tray.isSystemTrayAvailable():
+        win._tray.showMessage(
+            "Dupless Video", "Running in the background — open it from the tray icon.",
+            QSystemTrayIcon.Information, 5000)
+    else:
+        win.show()
     return app.exec()

@@ -193,11 +193,13 @@ def check(
 
 
 @app.command()
-def ui(db: Path = typer.Option(DEFAULT_DB, help="SQLite store path to explore")):
+def ui(db: Path = typer.Option(DEFAULT_DB, help="SQLite store path to explore"),
+       tray: bool = typer.Option(False, "--tray",
+                                 help="Start hidden in the system tray (used by the run-at-login entry).")):
     """Desktop UI: sortable duplicate tree, preview in VLC, send to Trash with
     confirmation, and feedback that recalibrates thresholds. Reads the existing DB; does not re-scan."""
     from dupdetect.ui.main import run
-    raise typer.Exit(run(str(db)))
+    raise typer.Exit(run(str(db), start_hidden=tray))
 
 
 @app.command()

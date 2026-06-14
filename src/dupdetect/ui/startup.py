@@ -20,17 +20,17 @@ def is_supported() -> bool:
 
 
 def launch_command(db: str) -> str:
-    """Command that opens the app (which auto-resumes the watcher) at login. Frozen (.exe): just the
-    installed app, which opens the GUI on the per-user DB. Source: the installed `dupdetect` console
-    script (no PYTHONPATH needed), else pythonw -m (no console window)."""
+    """Command that opens the app at login, HIDDEN in the system tray (`--tray`), where it auto-resumes
+    the watcher — no window pops up on every boot. Frozen (.exe): just the installed app. Source: the
+    installed `dupdetect` console script (no PYTHONPATH needed), else pythonw -m (no console window)."""
     if getattr(sys, "frozen", False):
-        return f'"{sys.executable}"'
+        return f'"{sys.executable}" --tray'
     exe = shutil.which("dupdetect")
     if exe:
-        return f'"{exe}" ui --db "{db}"'
+        return f'"{exe}" ui --db "{db}" --tray'
     pyw = Path(sys.executable).with_name("pythonw.exe")
     runner = str(pyw) if pyw.exists() else sys.executable
-    return f'"{runner}" -m dupdetect.cli ui --db "{db}"'
+    return f'"{runner}" -m dupdetect.cli ui --db "{db}" --tray'
 
 
 def is_enabled() -> bool:

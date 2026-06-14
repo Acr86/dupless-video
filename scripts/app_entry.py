@@ -122,7 +122,8 @@ def main() -> int:
         return 0
     _hold_app_mutex()                                   # let the installer/uninstaller detect us (AppMutex)
     runtime.configure_offline_model()                   # offline DINOv2 (no network on first scan)
-    return run(str(runtime.default_db_path()))
+    # `--tray` (written by the run-at-login entry): boot straight into the system tray, no window.
+    return run(str(runtime.default_db_path()), start_hidden="--tray" in sys.argv)
 
 
 if __name__ == "__main__":
