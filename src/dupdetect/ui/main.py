@@ -48,9 +48,9 @@ def _fmt_eta(seconds: int) -> str:
 class MainWindow(QMainWindow):
     def __init__(self, db_path: str):
         super().__init__()
+        self._settings = QSettings("Dupless Video", "Dupless Video")  # cross-session persistence
         self._db_path = db_path
         self.store = FingerprintStore(db_path)
-        self._settings = QSettings("Dupless Video", "Dupless Video")  # cross-session persistence
         self._hdr_ready: set = set()                    # trees whose header already has defaults applied
         self._persisted: set = set()                    # trees restored from a previous session
         self.setWindowTitle(f"Dupless Video · Duplicates — {db_path}")
@@ -84,6 +84,7 @@ class MainWindow(QMainWindow):
             bottom.addWidget(b)
 
         self.scan_panel = ScanPanel(db_path)
+        self.scan_panel.folder.setText(self._settings.value("scan_folder", "", str))  # last analyzed folder
         self.scan_panel.scan_finished.connect(self._on_scan_finished)
         self.scan_panel.db_changed.connect(self.switch_db)
 
@@ -248,6 +249,7 @@ class MainWindow(QMainWindow):
             self.store.close()
             self.store = FingerprintStore(db)
             self._db_path = db
+            self._settings.setValue("db_path", db)       # remember the active DB across sessions
             self.watch_panel.set_db(db)                  # watcher follows the active DB
             self.setWindowTitle(f"Dupless Video · Duplicates — {db}")
         self.refresh()
@@ -802,6 +804,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, e):
         self._settings.setValue("watch_folder", self.watch_panel.folder.text().strip())
+        self._settings.setValue("scan_folder", self.scan_panel.folder.text().strip())
         # X on the window = hide to the tray (the watcher keeps running in the background) WHEN the
         # "Minimize to tray on close" tray toggle is on (default). Turn it off -> the X exits for real.
         # Real exit is also always available via the tray's Quit. No tray -> always close+quit.
@@ -885,6 +888,13 @@ def run(db_path: str) -> int:
         probe.disconnectFromServer()
         return 0                                        # one already running -> don't duplicate window
     QLocalServer.removeServer(_SINGLETON)               # clean up orphaned socket from a crash
+
+    # Reopen the LAST-USED DB across sessions (the launch arg is only the first-run default).
+    # Resolved HERE (the entry point), not in MainWindow, so direct MainWindow(db) use stays testable.
+    # Guard: only if its folder still exists, so an unplugged drive never crashes startup.
+    _last_db = QSettings("Dupless Video", "Dupless Video").value("db_path", "", str)
+    if _last_db and Path(_last_db).parent.exists():
+        db_path = _last_db
 
     win = MainWindow(db_path)
     server = QLocalServer()
