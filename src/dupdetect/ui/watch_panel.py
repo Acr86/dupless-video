@@ -184,6 +184,9 @@ class WatchPanel(QGroupBox):
         # REAL cause inline AND in a one-time dialog (the panel has no live console / details button).
         cause = summarize_error(self._log)
         self.status.setText(f"❌ Watcher crashed (exit {code}) — {cause[:140]}")
-        QMessageBox.critical(self, "Background watch failed",
-                             f"The background watcher stopped unexpectedly (exit code {code}).\n\n"
-                             f"Cause: {cause}")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.NoIcon)                  # no icon -> no Windows system sound
+        box.setWindowTitle("Background watch failed")
+        box.setText(f"The background watcher stopped unexpectedly (exit code {code}).\n\n"
+                    f"Cause: {cause}")
+        box.exec()

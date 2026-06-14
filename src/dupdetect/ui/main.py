@@ -291,11 +291,11 @@ class MainWindow(QMainWindow):
         try:
             startup.set_enabled(enabled, self._db_path)
         except Exception as e:                          # noqa: BLE001 — surface, don't crash
-            QMessageBox.warning(self, "Start with Windows", f"Couldn't change the login entry:\n{e}")
+            _mbox(self, "Start with Windows", f"Couldn't change the login entry:\n{e}")
             self._act_startup.setChecked(startup.is_enabled())
             return
         if enabled and not self.watch_panel.folder.text().strip():
-            QMessageBox.information(
+            _mbox(
                 self, "Start with Windows",
                 "Enabled. Tip: set a folder in “Keep updated — background watch” so the watcher "
                 "resumes automatically when the app starts at login.")
@@ -315,7 +315,7 @@ class MainWindow(QMainWindow):
         """One-time intro explaining the initial scan + background watch (no forced wait)."""
         if self._settings.value("onboarded", False, bool):
             return
-        QMessageBox.information(
+        _mbox(
             self, "Welcome to Dupless Video",
             "How it works:\n\n"
             "• Run the analyzer (below) on your library ONCE. You can use the app right away — "
@@ -386,7 +386,7 @@ class MainWindow(QMainWindow):
                 f"⚠ {len(clusters)} clusters · cluster/match desync — re-scan (full) to refresh verdicts", 0)
             if not getattr(self, "_warned_drift", False):
                 self._warned_drift = True
-                QMessageBox.warning(
+                _mbox(
                     self, "Clusters out of sync",
                     "The clusters shown are out of sync with the match scores (likely an exact-only "
                     "scan ran after a full scan). Verdicts show empty and feedback won't recalibrate "
@@ -496,7 +496,7 @@ class MainWindow(QMainWindow):
 
     def _vlc_paths(self, paths: list[str]) -> None:
         if not paths:
-            QMessageBox.information(self, "Nothing checked", "Check (☑) videos to open them in VLC.")
+            self._toast("Check ☑ a video first to open it in VLC.")
             return
         for p in paths[:8]:                              # cap to avoid opening dozens of windows
             actions.open_in_vlc(p)
@@ -506,7 +506,7 @@ class MainWindow(QMainWindow):
         It's just a normal web search to help you locate/re-acquire the title on your own."""
         paths = self._checked_problem_paths(model)
         if not paths:
-            QMessageBox.information(self, "Nothing checked", "Check (☑) files to search on Google.")
+            self._toast("Check ☑ a file first to search it on Google.")
             return
         for p in paths[:6]:                              # cap: don't open dozens of tabs
             actions.web_search(clean_title(p))
@@ -521,7 +521,7 @@ class MainWindow(QMainWindow):
         else:
             src = [(p, (note or err or "")) for p, err, _cat, note in self.store.problems(category=kind)]
         if not src:
-            QMessageBox.information(self, "Export", "Nothing to export in this tab.")
+            self._toast("Nothing to export in this tab.")
             return
         fn, _ = QFileDialog.getSaveFileName(self, "Export list", f"{kind}_list.csv",
                                             "CSV (*.csv);;JSON (*.json)")
@@ -542,15 +542,15 @@ class MainWindow(QMainWindow):
         else:
             with open(fn, "w", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=cols); w.writeheader(); w.writerows(rows)
-        QMessageBox.information(self, "Export", f"Exported {len(rows)} item(s) to:\n{fn}")
+        self._toast(f"Exported {len(rows)} item(s) to {fn}")
 
     def _delete_problem_paths(self, paths: list[str]) -> None:
         """Sends files from the reindex/corrupt tabs to the Recycle Bin (they are not in clusters):
         send2trash + clears their problem record. Same behaviour as deleting duplicates."""
         if not paths:
-            QMessageBox.information(self, "Nothing checked", "Check (☑) videos to delete.")
+            self._toast("Check ☑ the videos you want to delete.")
             return
-        if QMessageBox.question(
+        if _mbox(
                 self, "Delete",
                 f"Send {len(paths)} file(s) to the Recycle Bin?",
                 QMessageBox.Yes | QMessageBox.Cancel) != QMessageBox.Yes:
@@ -565,13 +565,19 @@ class MainWindow(QMainWindow):
                 ok += 1
             except Exception as e:                       # noqa: BLE001
                 self.statusBar().showMessage(f"Error deleting {Path(p).name}: {e}", 4000)
-        QMessageBox.information(self, "Deletion", f"Sent {ok} to the Recycle Bin.")
+        self._toast(f"Sent {ok} to the Recycle Bin.")
         self.refresh()
 
     def _update_sel(self, *_):
         files = checked_files(self.model)
         total = sum(s for _, s in files)
         self.sel_lbl.setText(f"Selected: {len(files)} · {_gb(total)}")
+
+    def _toast(self, text: str, ms: int = 5000) -> None:
+        """Transient, NON-MODAL, SILENT notification in the status bar — replaces noisy info pop-ups
+        (a QMessageBox plays a Windows system sound per icon; the status bar makes none and doesn't
+        interrupt the user with a click-to-dismiss dialog)."""
+        self.statusBar().showMessage(text, ms)
 
     # ----------------------------------------------------------------- actions
     def _vlc_selected(self):
@@ -597,7 +603,7 @@ class MainWindow(QMainWindow):
     def _delete_selected(self):
         files = checked_files(self.model)
         if not files:
-            QMessageBox.information(self, "Nothing selected", "Check files to delete (the KEEP ★ can't be).")
+            self._toast("Check the files to delete (the KEEP ★ can't be).")
             return
         dlg = _ConfirmDelete(self, files)
         if dlg.exec() != QDialog.Accepted:
@@ -607,7 +613,7 @@ class MainWindow(QMainWindow):
         msg = f"Deleted {len(res.deleted)} · freed {_gb(res.freed_bytes)}"
         if res.errors:
             msg += f"\n{len(res.errors)} errors:\n" + "\n".join(f"· {p}: {e}" for p, e in res.errors[:8])
-        QMessageBox.information(self, "Deletion", msg)
+        self._toast(msg)                                 # silent, non-modal — the list refresh shows the result
         self.refresh()
 
     def _context_menu(self, pos):
@@ -683,7 +689,7 @@ class MainWindow(QMainWindow):
             if n_usable < n_feedback:
                 msg += (f"\n\n{n_feedback - n_usable} pair(s) couldn't be recovered "
                         "(missing fingerprints/.npy, or torch unavailable). Re-scan to restore them.")
-            QMessageBox.information(self, "Recalibrate", msg)
+            _mbox(self, "Recalibrate", msg)
             return
         sug = suggest_thresholds(sigs, base=load_thresholds())
         n_same = sum(1 for s in sigs if s.is_same)
@@ -694,10 +700,10 @@ class MainWindow(QMainWindow):
                 f"Suggested:  θv → {sug['theta_v']}    θa → {sug['theta_a']}\n"
                 f"Result: T1/T2 false positives = {sug['false_positives_T1T2']}  ·  recall = {sug['recall_dup']}\n\n"
                 "Doesn't touch detections already made; applies to future scans.")
-        if QMessageBox.question(self, "Recalibrate thresholds (from your feedback)", text,
+        if _mbox(self, "Recalibrate thresholds (from your feedback)", text,
                                 QMessageBox.Apply | QMessageBox.Cancel) == QMessageBox.Apply:
             p = actions.apply_thresholds(sug["theta_v"], sug["theta_a"])
-            QMessageBox.information(self, "Applied", f"Thresholds written to:\n{p}")
+            self._toast(f"Thresholds updated — written to {p}")
 
     # --------------------------------------------------- indexes to rebuild / corrupted
     def _repair_indexes(self):
@@ -708,7 +714,7 @@ class MainWindow(QMainWindow):
         n = len(problem_paths(self.reindex_model)) if self.reindex_model is not None else 0
         if not n:
             return
-        if QMessageBox.question(
+        if _mbox(
                 self, "Rebuild indexes",
                 f"Rebuild the index of {n} file(s) via remux (no re-encode). Replaces the original "
                 "ATOMICALLY (remux→verify→replace). Continue?",
@@ -773,7 +779,7 @@ class MainWindow(QMainWindow):
         self.rx_progress.hide(); self.rx_status.hide()
         self.btn_repair.setText("🔧 Rebuild indexes")
         out = "\n".join(self._repair_log[-40:]) or "Done."
-        QMessageBox.information(self, "Index rebuild", out)
+        _mbox(self, "Index rebuild", out)
         self.refresh()                                  # repaint tabs (repaired items disappear)
 
     def _open_corrupt_folder(self):
@@ -782,7 +788,7 @@ class MainWindow(QMainWindow):
     def _open_folders(self, paths: list[str]) -> None:
         """Opens the folders of checked files in the file explorer (cap 8)."""
         if not paths:
-            QMessageBox.information(self, "Nothing checked", "Check (☑) videos to open their folder.")
+            self._toast("Check ☑ a video first to open its folder.")
             return
         import subprocess
         for p in paths[:8]:
@@ -820,6 +826,19 @@ class MainWindow(QMainWindow):
         QApplication.instance().quit()
 
 
+def _mbox(parent, title: str, text: str, buttons=QMessageBox.Ok, default=QMessageBox.NoButton) -> int:
+    """A message box with NO icon -> no Windows 'ding' (the system sound is tied to the icon).
+    Returns the clicked StandardButton. Use for modal confirmations / notices that must be seen."""
+    box = QMessageBox(parent)
+    box.setWindowTitle(title)
+    box.setText(text)
+    box.setStandardButtons(buttons)
+    if default != QMessageBox.NoButton:
+        box.setDefaultButton(default)
+    box.setIcon(QMessageBox.NoIcon)                      # the icon is what triggers the system sound
+    return box.exec()
+
+
 class _ConfirmDelete(QDialog):
     """Confirmation dialog: lists EVERYTHING being deleted + total, and the destination."""
     def __init__(self, parent, files: list[tuple[str, int]]):
@@ -851,7 +870,7 @@ class _ConfirmDelete(QDialog):
 
     def _accept(self):
         if self.dest() == "permanent" and not self._ack.isChecked():
-            QMessageBox.warning(self, "Confirmation required",
+            _mbox(self, "Confirmation required",
                                 "Check 'I understand this is irreversible' to delete permanently.")
             return
         self.accept()

@@ -413,7 +413,7 @@ class ScanPanel(QGroupBox):
                    if ln.startswith(("- ", "WARNING", "Skipped ")) or "problematic" in ln]
         info = "\n".join(flagged[-18:]) if flagged else "No skipped files or warnings."
         box = QMessageBox(self)
-        box.setIcon(QMessageBox.Critical if code else QMessageBox.Information)
+        box.setIcon(QMessageBox.NoIcon)                   # no icon -> no Windows system sound
         box.setWindowTitle(title)
         if code:                                          # failure: LEAD with the real cause, not just the code
             box.setText(f"The analysis failed (exit code {code}).")
