@@ -65,13 +65,26 @@ def pending_files(targets, store: FingerprintStore, fv: str, recursive: bool = T
     return out
 
 
+def _norm(path: str) -> str:
+    """Absolute + case/separator-normalized. `os.path.normcase` folds case AND maps '/'->'\\' on
+    Windows, and is the IDENTITY on case-sensitive POSIX -> path comparisons are robust to how the
+    path was written without breaking Linux/macOS."""
+    return os.path.normcase(os.path.abspath(path))
+
+
 def orphan_paths(targets, store: FingerprintStore) -> list[str]:
-    """Indexed paths under `targets` whose file is gone from disk -> to forget (self-heal)."""
-    roots = [os.path.abspath(t) for t in _as_list(targets)]
+    """Indexed paths under `targets` whose file is gone from disk -> to forget (self-heal).
+
+    The root match is NORMALIZED (case + separators, via `os.path.normcase`): on Windows the
+    filesystem is case-insensitive but the STORED path (from the scan) and the WATCHED root string
+    can differ in case — without normalizing, a trashed file under a differently-cased root is never
+    detected and lingers in the list. A trailing-separator boundary keeps a sibling folder that only
+    shares a name prefix from matching (e.g. 'Series' must not swallow 'Series2')."""
+    roots = [_norm(t).rstrip(os.sep) for t in _as_list(targets)]
     out: list[str] = []
     for p in store.all_paths():
-        ap = os.path.abspath(p)
-        if any(ap.startswith(r) for r in roots) and not os.path.exists(p):
+        ap = _norm(p)
+        if any(ap == r or ap.startswith(r + os.sep) for r in roots) and not os.path.exists(p):
             out.append(p)
     return out
 

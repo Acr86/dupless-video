@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import os
 import time
+from pathlib import Path
 
 import numpy as np
+import pytest
 
 from dupdetect import watch
 from dupdetect.config import load_thresholds
@@ -62,6 +64,35 @@ def test_orphan_paths_finds_deleted(tmp_path):
     s.save(_rec(tmp_path / "gone.mp4"), feature_version="fv")    # never created on disk
     orph = watch.orphan_paths(str(tmp_path), s)
     assert str(tmp_path / "gone.mp4") in orph and exists not in orph
+    s.close()
+
+
+def test_orphan_paths_normalized_root_and_boundary(tmp_path):
+    """The watch root is normalized (case+separators via normcase) before comparison, so a root
+    written with different separators / a trailing slash still finds orphans; and a sibling folder
+    that only shares a name PREFIX ('Series2' vs root 'Series') is NOT falsely matched."""
+    s = FingerprintStore(tmp_path / "w.sqlite")
+    series = tmp_path / "Series"; series.mkdir()
+    series2 = tmp_path / "Series2"; series2.mkdir()
+    s.save(_rec(series / "gone.mp4"), feature_version="fv")        # orphan under Series
+    s.save(_rec(series2 / "alive.mp4"), feature_version="fv")      # sibling sharing the name prefix
+    root = str(series).replace(os.sep, "/") + "/"                 # odd-but-equivalent root form
+    orph = {Path(p).name for p in watch.orphan_paths(root, s)}
+    assert "gone.mp4" in orph                                      # detected despite the root form
+    assert "alive.mp4" not in orph                                # sibling prefix NOT falsely matched
+    s.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="paths are case-insensitive only on Windows")
+def test_orphan_paths_case_insensitive_root_on_windows(tmp_path):
+    """Windows: a watch root whose CASE differs from the indexed path (the FS is case-insensitive)
+    must still detect orphans — otherwise a file sent to the Recycle Bin is never removed from the
+    list. This was the bug: case-sensitive startswith missed the orphan."""
+    s = FingerprintStore(tmp_path / "w.sqlite")
+    sub = tmp_path / "Series"; sub.mkdir()
+    s.save(_rec(sub / "gone.mp4"), feature_version="fv")
+    orph = watch.orphan_paths(str(sub).replace("Series", "series"), s)   # lowercased watch root
+    assert any(Path(p).name == "gone.mp4" for p in orph)
     s.close()
 
 
