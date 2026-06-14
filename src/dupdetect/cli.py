@@ -95,11 +95,14 @@ def scan(
                                   "skip matching. Use to (re)index a large library cheaply, then "
                                   "run a normal scan to do Pass-2. Avoids the O(N^2) candidate "
                                   "blow-up until you're ready."),
-    out: Path = typer.Option(Path("reports/scan.json"), help="Cluster report"),
+    out: Path = typer.Option(None, help="Cluster report JSON (default: a 'reports' folder next to the DB)"),
 ):
     """Indexes paths (files and/or folders, in place, without copying) and reports clusters + review queue."""
     from dupdetect.pipeline.fullscan import collect_videos, filter_by_height
 
+    # Report goes NEXT TO THE DB (always writable — we open the DB there). A CWD-relative default like
+    # 'reports/scan.json' crashed the frozen app: its CWD is the read-only install dir -> WinError 5.
+    out = Path(out) if out is not None else Path(db).parent / "reports" / "scan.json"
     th, store, embedder = _bootstrap(db, config)
     if fp8_embed:
         embedder.fp8 = True                            # applied when the model is loaded (lazy)
