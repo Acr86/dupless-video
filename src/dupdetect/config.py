@@ -17,6 +17,25 @@ else:
     DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "config" / "thresholds.yaml"
 
 
+def user_thresholds_path() -> Path:
+    """Writable per-user thresholds override — the recalibration target. The bundled DEFAULT_CONFIG is
+    READ-ONLY in the frozen app, so recalibrated θ persist in the user data dir instead."""
+    from dupdetect.runtime import app_data_dir
+    return app_data_dir() / "thresholds.yaml"
+
+
+def effective_config_path() -> Path:
+    """The thresholds file actually loaded. In the FROZEN app a per-user override (written by
+    recalibration) takes precedence over the read-only bundled default; in dev the repo config is used
+    directly (writable, and keeps tests deterministic). Shipped defaults stay fixed for anyone who has
+    not recalibrated (§0)."""
+    if getattr(sys, "frozen", False):
+        up = user_thresholds_path()
+        if up.exists():
+            return up
+    return DEFAULT_CONFIG
+
+
 @dataclass
 class Thresholds:
     raw: dict[str, Any]
@@ -146,6 +165,6 @@ class Thresholds:
 
 
 def load_thresholds(path: Path | str | None = None) -> Thresholds:
-    p = Path(path) if path else DEFAULT_CONFIG
+    p = Path(path) if path else effective_config_path()
     with open(p, "r", encoding="utf-8") as f:
         return Thresholds(raw=yaml.safe_load(f))

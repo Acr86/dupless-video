@@ -139,16 +139,28 @@ def delete_files(store: FingerprintStore, files: list[tuple[str, int]], dest: st
 
 
 def apply_thresholds(theta_v: float, theta_a: float, config_path: str | None = None) -> str:
-    """Writes the recalibrated thresholds to thresholds.yaml (only θv/θa, which is what
-    suggest_thresholds sweeps). Affects FUTURE scans, not already-completed detection. Returns the written path."""
+    """Writes the recalibrated thresholds (only θv/θa, which is what suggest_thresholds sweeps).
+    With no explicit path: in the FROZEN app the bundled config is READ-ONLY, so it writes a per-user
+    OVERRIDE in the data dir (load_thresholds prefers it) instead of crashing with WinError 5; in dev
+    it writes the repo config as before. Affects FUTURE scans, not completed detection. Returns the path."""
+    import sys
+    from pathlib import Path
+
     import yaml
 
-    from dupdetect.config import DEFAULT_CONFIG
-    p = str(config_path or DEFAULT_CONFIG)
-    with open(p, encoding="utf-8") as f:
+    from dupdetect.config import DEFAULT_CONFIG, effective_config_path, user_thresholds_path
+    src = Path(config_path) if config_path else effective_config_path()    # base on the current config
+    with open(src, encoding="utf-8") as f:
         raw = yaml.safe_load(f)
     raw["video"]["theta_v"] = float(theta_v)
     raw["audio"]["theta_a"] = float(theta_a)
-    with open(p, "w", encoding="utf-8") as f:
+    if config_path:
+        dst = Path(config_path)
+    elif getattr(sys, "frozen", False):
+        dst = user_thresholds_path()                  # bundled config is read-only -> per-user override
+    else:
+        dst = Path(DEFAULT_CONFIG)                     # dev: repo config (writable), as before
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with open(dst, "w", encoding="utf-8") as f:
         yaml.safe_dump(raw, f, sort_keys=False, allow_unicode=True)
-    return p
+    return str(dst)

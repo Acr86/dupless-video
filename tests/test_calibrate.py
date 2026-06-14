@@ -6,6 +6,7 @@ sweep and the confusion matrix in isolation.
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import asdict
 
 import numpy as np
@@ -191,3 +192,34 @@ def test_labeled_from_feedback_skips_lite_without_embeddings(store, th, monkeypa
     monkeypatch.setattr(cal, "_align_pair", _no_align)   # must not attempt alignment without embeddings
     sigs = labeled_signals_from_feedback(store, th=th)
     assert sigs == []
+
+
+# ------------------------------------------------- apply_thresholds (frozen-app write target)
+
+def test_apply_thresholds_frozen_writes_user_override(tmp_path, monkeypatch):
+    """Frozen app: the bundled thresholds.yaml is READ-ONLY, so recalibrate must write a per-user
+    OVERRIDE in the data dir (not crash with WinError 5), and load_thresholds then prefers it."""
+    from pathlib import Path
+
+    import dupdetect.config as cfg
+    from dupdetect.ui import actions
+    override = tmp_path / "thresholds.yaml"
+    monkeypatch.setattr(cfg, "user_thresholds_path", lambda: override)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    p = actions.apply_thresholds(0.81, 0.93)             # no explicit path -> per-user override (frozen)
+    assert Path(p) == override and override.exists()      # wrote the override, NOT the bundled config
+    th2 = cfg.load_thresholds()                           # frozen + override exists -> prefers it
+    assert th2.theta_v == 0.81 and th2.theta_a == 0.93
+
+
+def test_apply_thresholds_explicit_path_is_respected(tmp_path):
+    """An explicit config_path is written in place (used by tests/automation; no data-dir side effects)."""
+    import yaml
+
+    from dupdetect.ui import actions
+    cfg_file = tmp_path / "t.yaml"
+    cfg_file.write_text(yaml.safe_dump({"video": {"theta_v": 0.5}, "audio": {"theta_a": 0.5}}), "utf-8")
+    p = actions.apply_thresholds(0.8, 0.9, config_path=str(cfg_file))
+    assert p == str(cfg_file)
+    raw = yaml.safe_load(cfg_file.read_text("utf-8"))
+    assert raw["video"]["theta_v"] == 0.8 and raw["audio"]["theta_a"] == 0.9
