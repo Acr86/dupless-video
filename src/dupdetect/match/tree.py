@@ -8,6 +8,11 @@ from __future__ import annotations
 from dupdetect.config import Thresholds
 from dupdetect.models import AlignResult, Record, Result, Verdict
 
+# Reason string for the T0 tier (byte-identity by sampled hash). Exposed so the exact-only
+# sweep (pipeline.fullscan.exact_scan) stamps the SAME verdict as the full tree — keeping the
+# `clusters` and `matches` tables in sync (see ui.data.drift_report).
+T0_REASON = "T0 sampled hash identical (verify byte-exact before deleting)"
+
 
 def _cut_density(rec: Record) -> float:
     """Scene cuts per second. A coarse signature (low density — SEEK-sampled giants) is not
@@ -37,7 +42,7 @@ def decide_tree(
     # M1: xxhash(head|mid|tail)+size is probabilistically very safe, but NOT
     # byte-identical literally. For a DELETE action, verify byte-exact.
     if a.content_hash == b.content_hash and a.size == b.size:
-        return make(Verdict.CERTAIN, 1.00, "T0 sampled hash identical (verify byte-exact before deleting)")
+        return make(Verdict.CERTAIN, 1.00, T0_REASON)
 
     # ---- GUARD edition vs duplicate (before declaring dup) -------------
     # If video aligns strongly but 'b' is a contiguous superset of 'a' (or vice versa),

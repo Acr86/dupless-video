@@ -705,11 +705,12 @@ class MainWindow(QMainWindow):
                 f"{orphan_note}\n\n"
                 f"Suggested:  θv → {sug['theta_v']}    θa → {sug['theta_a']}\n"
                 f"Result: T1/T2 false positives = {sug['false_positives_T1T2']}  ·  recall = {sug['recall_dup']}\n\n"
-                "Doesn't touch detections already made; applies to future scans.")
+                "Re-applies to your existing results (re-decides matches, no re-scan) and to future scans.")
         if _mbox(self, "Recalibrate thresholds (from your feedback)", text,
                                 QMessageBox.Apply | QMessageBox.Cancel) == QMessageBox.Apply:
-            p = actions.apply_thresholds(sug["theta_v"], sug["theta_a"])
-            self._toast(f"Thresholds updated — written to {p}")
+            p = actions.apply_thresholds(sug["theta_v"], sug["theta_a"], store=self.store)
+            self.refresh()                                  # re-applied to existing results -> reflect it
+            self._toast(f"Thresholds updated and re-applied to existing results — {p}")
 
     # --------------------------------------------------- indexes to rebuild / corrupted
     def _repair_indexes(self):

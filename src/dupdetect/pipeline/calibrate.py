@@ -161,6 +161,56 @@ def verdict_of(sig: LabeledSignal, th: Thresholds) -> Verdict:
     return decide_tree(_mk("a", "ha"), _mk("b", "hb"), sig.audio, sig.video, sig.scenes, th).verdict
 
 
+def apply_thresholds_to_store(store, th: Thresholds, rebuild: bool = True) -> dict:
+    """Re-apply thresholds `th` to the EXISTING matches WITHOUT re-decoding or re-aligning.
+
+    The raw per-pair signals are already serialized in `matches` (audio_json/video_json/
+    scenes_json); this reloads them with `_parse_align`, rebuilds the two endpoint records with
+    their REAL fields (content_hash/size/scene_cuts/duration — so the T0 byte-identity and the
+    T4 cut-density guard stay correct, unlike the `_mk` stub used for calibration sweeps), and
+    re-runs the pure `decide_tree`. Only rows whose verdict actually moves are rewritten, so
+    re-applying the current thresholds is a no-op.
+
+    Rows with NO stored signals are threshold-independent and left untouched: T0 (hash identity)
+    and NAME_COPY (name-based, content-vetoed). Orphan rows whose endpoints are no longer indexed
+    are skipped. With `rebuild`, `clusters` is rebuilt from the updated matches (which also
+    reconciles any pre-existing clusters<->matches drift). Cheap: zero decode/embed/GPU.
+    Returns counts + the verdict transitions observed."""
+    rows = store.conn.execute(
+        "SELECT a_path, b_path, verdict, ad_offset_s, audio_json, video_json, scenes_json "
+        "FROM matches"
+    ).fetchall()
+    evaluated = changed = skipped_no_signals = skipped_orphan = 0
+    transitions: dict[str, int] = {}
+    for r in rows:
+        if not (r["audio_json"] or r["video_json"] or r["scenes_json"]):
+            skipped_no_signals += 1                       # T0 / NAME_COPY: threshold-independent
+            continue
+        ra = store.load(r["a_path"], with_embeddings=False)
+        rb = store.load(r["b_path"], with_embeddings=False)
+        if ra is None or rb is None:
+            skipped_orphan += 1                           # an endpoint is no longer indexed
+            continue
+        evaluated += 1
+        res = decide_tree(ra, rb, _parse_align(r["audio_json"]), _parse_align(r["video_json"]),
+                          _parse_align(r["scenes_json"]), th)
+        if res.verdict.value != r["verdict"]:             # tier moved -> reason/confidence too
+            changed += 1
+            key = f"{r['verdict']}->{res.verdict.value}"
+            transitions[key] = transitions.get(key, 0) + 1
+            store.save_match(r["a_path"], r["b_path"], res.verdict.value, res.confidence,
+                             res.reason, ad_offset_s=r["ad_offset_s"],
+                             audio_json=r["audio_json"], video_json=r["video_json"],
+                             scenes_json=r["scenes_json"])
+    clusters = 0
+    if rebuild:
+        from dupdetect.pipeline.fullscan import _rebuild_clusters   # deferred: avoids import cycle
+        clusters = len(_rebuild_clusters(store, th))
+    return {"evaluated": evaluated, "changed": changed, "transitions": transitions,
+            "skipped_no_signals": skipped_no_signals, "skipped_orphan": skipped_orphan,
+            "clusters": clusters}
+
+
 def confusion_by_tier(signals: list[LabeledSignal], th: Thresholds) -> dict:
     """Table verdict -> {same, diff}: how many were same vs different movie in each tier."""
     table: dict[str, dict[str, int]] = {}

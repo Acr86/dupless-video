@@ -131,11 +131,15 @@ def delete_files(store: FingerprintStore, files: list[tuple[str, int]]) -> Delet
     return DeleteResult(deleted=deleted, errors=errors, freed_bytes=freed)
 
 
-def apply_thresholds(theta_v: float, theta_a: float, config_path: str | None = None) -> str:
+def apply_thresholds(theta_v: float, theta_a: float, config_path: str | None = None,
+                     store=None) -> str:
     """Writes the recalibrated thresholds (only θv/θa, which is what suggest_thresholds sweeps).
     With no explicit path: in the FROZEN app the bundled config is READ-ONLY, so it writes a per-user
     OVERRIDE in the data dir (load_thresholds prefers it) instead of crashing with WinError 5; in dev
-    it writes the repo config as before. Affects FUTURE scans, not completed detection. Returns the path."""
+    it writes the repo config as before. When `store` is given, the new θ are ALSO re-applied to the
+    already-scanned results (re-decides existing matches from their stored signals + rebuilds clusters,
+    cheap: no decode), so recalibration affects completed detection too, not only future scans.
+    Returns the config path."""
     import sys
     from pathlib import Path
 
@@ -156,4 +160,8 @@ def apply_thresholds(theta_v: float, theta_a: float, config_path: str | None = N
     dst.parent.mkdir(parents=True, exist_ok=True)
     with open(dst, "w", encoding="utf-8") as f:
         yaml.safe_dump(raw, f, sort_keys=False, allow_unicode=True)
+    if store is not None:                             # re-apply the new θ to ALREADY-scanned results too
+        from dupdetect.config import Thresholds
+        from dupdetect.pipeline.calibrate import apply_thresholds_to_store
+        apply_thresholds_to_store(store, Thresholds(raw=raw))
     return str(dst)

@@ -35,6 +35,7 @@ from tqdm import tqdm
 from dupdetect.features.frames import decode_frames
 from dupdetect.features.hashing import content_hash
 from dupdetect.features.probe import ffprobe
+from dupdetect.match.tree import T0_REASON
 from dupdetect.quality.color import CLIP_DOWNGRADE_MARGIN, GRADE_DIVERGENCE
 from dupdetect.quality.language import detect_language
 from dupdetect.pipeline.analyze import (
@@ -485,6 +486,16 @@ def exact_scan(targets, store: FingerprintStore, th: Thresholds, workers: int = 
         for m in members:
             store.save_cluster(cid, m, is_keep=(m == ranked["keep"]),
                                rank_reason=ranked["evidence"].get(m, ""))
+        # M1: stamp the T0 verdict so each byte-identical pair reads as CERTAIN, not 'Review
+        # only'. exact_scan builds clusters but historically never wrote `matches`, so the
+        # verdict was empty and the two tables drifted (ui.data.drift_report). Members share
+        # (hash, size) -> the T0 tier holds by construction. Star topology (a representative
+        # linked to every other copy) is O(N); skip a pair that already carries a content
+        # verdict so a prior full-scan T1 is not clobbered (mirrors the has_match rule).
+        hub = ranked["keep"] or members[0]
+        for m in members:
+            if m != hub and not store.has_match(hub, m):
+                store.save_match(hub, m, Verdict.CERTAIN.value, 1.00, T0_REASON)
         clusters_out.append({"cluster_id": cid, **ranked})
 
     return {"clusters": clusters_out, "review_queue": [], "editions": [],

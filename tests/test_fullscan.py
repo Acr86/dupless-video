@@ -12,7 +12,7 @@ from dupdetect.models import Probe, Quality, Record
 from dupdetect.pipeline.fullscan import (
     UnionFind, _cluster_has_ads, _rebuild_clusters, exact_scan, full_scan, rank_cluster,
 )
-from dupdetect.store import FingerprintStore
+from dupdetect.store import FingerprintStore, canonical_pair
 
 FV = "test|v1"
 
@@ -195,7 +195,9 @@ def test_drain_pipelined_processes_all_and_is_resilient(monkeypatch, store):
 
 def test_exact_scan_detects_byte_identical_files(th, store, tmp_path):
     """Exact-only mode: groups byte-identical files by hash, saves LITE records (no
-    embeddings) that the UI can display, and excludes differing files."""
+    embeddings) that the UI can display, and excludes differing files. It must ALSO stamp
+    the T0 verdict in `matches` so the pair reads as CERTAIN, not just 'Review only'
+    (otherwise clusters and matches drift — see ui.data.drift_report)."""
     import shutil
 
     av = pytest.importorskip("av")
@@ -220,12 +222,96 @@ def test_exact_scan_detects_byte_identical_files(th, store, tmp_path):
     assert len(rep["clusters"]) == 1                      # exactly one identical group
     members = {rep["clusters"][0]["keep"], *rep["clusters"][0]["discard"]}
     assert members == {str(a), str(b)} and str(d) not in members
+    # M1: the byte-identical pair must be stamped CERTAIN (T0) in `matches`, not left
+    # verdict-less ("Review only"). Without this, clusters and matches drift.
+    assert store.has_match(str(a), str(b))
+    ca, cb = canonical_pair(str(a), str(b))
+    row = store.conn.execute(
+        "SELECT verdict, confidence, reason FROM matches WHERE a_path=? AND b_path=?", (ca, cb)
+    ).fetchone()
+    assert row is not None and row["verdict"] == "CERTAIN"
+    assert row["confidence"] == pytest.approx(1.0)
+    assert row["reason"].startswith("T0")
+    assert not store.has_match(str(a), str(d))           # the different file is not a duplicate
     # LITE record: has hash + probe but NO embeddings (the expensive pass was skipped)
     rec = store.load(str(a), with_embeddings=False)
     assert rec is not None and rec.content_hash and rec.embeddings.size == 0
     # incremental: re-running does not re-hash (reuses stored hash), same result
     rep2 = exact_scan([str(tmp_path)], store, th, workers=1, recursive=True)
     assert len(rep2["clusters"]) == 1
+
+
+# --------------------------------------------------------- apply_thresholds_to_store
+
+def test_apply_thresholds_to_store_redecides_from_stored_signals(th, store):
+    """Re-applies thresholds to existing matches WITHOUT decoding: re-runs decide_tree over
+    the signals already in `matches`. Tightening a threshold flips a content verdict; the SAME
+    thresholds are a no-op; signal-less rows (T0 / NAME_COPY) are threshold-independent -> kept."""
+    import copy
+    import json as _json
+
+    from dupdetect.config import Thresholds
+    from dupdetect.pipeline.calibrate import apply_thresholds_to_store
+
+    store.save(_rec("/a.mkv"), feature_version=FV)
+    store.save(_rec("/b.mkv"), feature_version=FV)
+    # content pair that clears T1 under default thresholds (audio+video agree, good coverage)
+    store.save_match(
+        "/a.mkv", "/b.mkv", "CERTAIN", 0.99, "T1 placeholder",
+        audio_json=_json.dumps({"score": 0.85}),
+        video_json=_json.dumps({"score": 0.80, "coverage": 0.90, "contiguous_superset": False}),
+        scenes_json=_json.dumps({"score": 0.0}))
+    # signal-less NAME_COPY row: threshold-independent, must never be re-decided
+    store.save(_rec("/n1.mkv"), feature_version=FV)
+    store.save(_rec("/n2.mkv"), feature_version=FV)
+    store.save_match("/n1.mkv", "/n2.mkv", "NAME_COPY", 0.75, "same name except (N)")
+
+    def _verdict(a):
+        return store.conn.execute("SELECT verdict FROM matches WHERE a_path=?", (a,)).fetchone()[0]
+
+    # same thresholds -> idempotent no-op (no verdict changes)
+    rep0 = apply_thresholds_to_store(store, th)
+    assert rep0["changed"] == 0 and _verdict("/a.mkv") == "CERTAIN"
+    assert rep0["skipped_no_signals"] >= 1                          # the NAME_COPY row
+
+    # tighten the video threshold so the pair no longer clears T1 -> drops to review
+    tight_raw = copy.deepcopy(th.raw)
+    tight_raw["video"]["theta_v"] = 0.95
+    tight = Thresholds(raw=tight_raw)
+    rep = apply_thresholds_to_store(store, tight)
+    assert rep["changed"] == 1
+    assert rep["transitions"].get("CERTAIN->PROBABLE") == 1
+    assert _verdict("/a.mkv") == "PROBABLE"
+    assert _verdict("/n1.mkv") == "NAME_COPY"                       # signal-less row untouched
+
+
+def test_apply_thresholds_action_reapplies_to_store(store, tmp_path):
+    """The recalibrate action re-applies the new θ to ALREADY-scanned results when a store is
+    passed: it writes the config AND re-decides existing matches (no decode)."""
+    import json as _json
+    import shutil
+
+    import yaml
+
+    from dupdetect.config import effective_config_path
+    from dupdetect.ui import actions
+
+    store.save(_rec("/a.mkv"), feature_version=FV)
+    store.save(_rec("/b.mkv"), feature_version=FV)
+    store.save_match(
+        "/a.mkv", "/b.mkv", "CERTAIN", 0.99, "T1 placeholder",
+        audio_json=_json.dumps({"score": 0.85}),
+        video_json=_json.dumps({"score": 0.80, "coverage": 0.90, "contiguous_superset": False}),
+        scenes_json=_json.dumps({"score": 0.0}))
+
+    cfg = tmp_path / "th.yaml"
+    shutil.copyfile(effective_config_path(), cfg)                   # an existing config to base on
+    out = actions.apply_thresholds(0.95, 0.80, config_path=str(cfg), store=store)
+
+    assert out == str(cfg)
+    assert yaml.safe_load(cfg.read_text(encoding="utf-8"))["video"]["theta_v"] == pytest.approx(0.95)
+    v = store.conn.execute("SELECT verdict FROM matches WHERE a_path='/a.mkv'").fetchone()[0]
+    assert v == "PROBABLE"                                          # T1 no longer clears -> review
 
 
 # --------------------------------------------------------------- full_scan empty dir
