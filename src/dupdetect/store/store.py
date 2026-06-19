@@ -19,6 +19,11 @@ from dupdetect.quality.color import ColorStats
 
 SCHEMA = Path(__file__).with_name("schema.sql")
 
+# A cluster needs at least this many members to be a duplicate GROUP; one copy left is 'resolved'.
+# Shared so the DB prune (prune_singleton_clusters) and the optimistic UI prune (ui.model.remove_paths)
+# can't silently disagree on the rule.
+MIN_CLUSTER_MEMBERS = 2
+
 
 class FingerprintStore:
     def __init__(self, db_path: str | Path, emb_dir: str | Path | None = None,
@@ -467,7 +472,8 @@ class FingerprintStore:
         stays in `files` and on disk; it simply stops appearing in the duplicates list."""
         self.conn.execute(
             "DELETE FROM clusters WHERE cluster_id IN ("
-            "  SELECT cluster_id FROM clusters GROUP BY cluster_id HAVING COUNT(*) < 2)")
+            "  SELECT cluster_id FROM clusters GROUP BY cluster_id HAVING COUNT(*) < ?)",
+            (MIN_CLUSTER_MEMBERS,))
         self.conn.commit()
 
     def save_cluster(self, cluster_id: int, path: str, is_keep: bool,
@@ -518,9 +524,11 @@ class FingerprintStore:
         )
         self.conn.commit()
 
-    def forget_file(self, path: str) -> None:
+    def forget_file(self, path: str) -> bool:
         """Forgets a deleted file: removes its `files` row, its matches and cluster membership,
-        and deletes its `.npy` embeddings file. Prevents 'ghosts' after deletion."""
+        and deletes its `.npy` embeddings file. Prevents 'ghosts' after deletion. Returns True if a
+        `files` row actually existed (let the event-drain count only real removals and ignore a path
+        whose stored form didn't match — it falls through to the periodic full sweep)."""
         row = self.conn.execute("SELECT emb_path FROM files WHERE path=?", (str(path),)).fetchone()
         if row and row["emb_path"]:
             ep = row["emb_path"]
@@ -533,6 +541,7 @@ class FingerprintStore:
         self.conn.execute("DELETE FROM matches WHERE a_path=? OR b_path=?", (str(path), str(path)))
         self.conn.execute("DELETE FROM clusters WHERE path=?", (str(path),))
         self.conn.commit()
+        return row is not None
 
     def close(self) -> None:
         self.conn.close()

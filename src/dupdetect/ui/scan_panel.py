@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from dupdetect import runtime
-from dupdetect.util import summarize_error
+from dupdetect.util import clock_to_secs, fmt_duration, summarize_error
 
 # Pipeline stages per depth — shown as an animated stepper so a LONG scan reads as clear forward
 # motion (which step, what it does, what's next) instead of one opaque bar. (short label, what it does)
@@ -66,6 +66,7 @@ class ScanPanel(QGroupBox):
         self._viz = None                                 # lazy "What the AI sees" window
         self._elapsed = 0
         self._phase_text = "Listo."                      # last known status (the clock is appended to it)
+        self._canceled = False                           # user pressed Cancel -> NOT a failure (state, not text)
         self._log: list[str] = []                        # captured output (shown if the run fails)
         self._heartbeat = QTimer(self)
         self._heartbeat.setInterval(1000)
@@ -213,6 +214,7 @@ class ScanPanel(QGroupBox):
         self.proc.finished.connect(self._done)
         self._elapsed = 0
         self._log = []
+        self._canceled = False                           # fresh run -> clear any prior cancel
         self._phase_text = "Starting… (searching files; may take a while on large libraries)"
         self._stages = _STAGES.get(depth, _STAGES["standard"])
         self._stage_idx, self._pulse = 0, 0              # light up the first stage right away
@@ -262,8 +264,7 @@ class ScanPanel(QGroupBox):
     def _render(self):
         """Shows the last known status + elapsed clock, so activity is ALWAYS visible even
         when the current phase emits no lines (e.g. enumerating millions of files)."""
-        mm, ss = divmod(self._elapsed, 60)
-        self.status.setText(f"{self._phase_text}   ·   ⏱ {mm:d}:{ss:02d}")
+        self.status.setText(f"{self._phase_text}   ·   ⏱ {fmt_duration(self._elapsed)}")
 
     # ------------------------------------------------------------------ progreso
     def _read(self):
@@ -340,7 +341,7 @@ class ScanPanel(QGroupBox):
             rate = er.group(2).strip()
             if rate:
                 bits.append(rate)                        # e.g. 9.7s/film
-            bits.append(f"ETA {er.group(1)}")            # remaining time
+            bits.append(f"ETA {fmt_duration(clock_to_secs(er.group(1)))}")   # H:MM:SS, days past 24h
         fr, sk = _FRESH.search(line), _SKIP.search(line)
         if fr and fr.group(1) != "0":
             bits.append(f"fresh {fr.group(1)}")
@@ -356,6 +357,7 @@ class ScanPanel(QGroupBox):
     # ------------------------------------------------------------------ control
     def _stop(self):
         if self.proc and self.proc.state() != QProcess.NotRunning:
+            self._canceled = True                        # state flag: _done must NOT read it as a failure
             pid = int(self.proc.processId())
             from dupdetect.util import CREATE_NO_WINDOW
             subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
@@ -370,8 +372,9 @@ class ScanPanel(QGroupBox):
             w.setEnabled(True)
         self.detail_btn.setEnabled(bool(self._log))       # run log available
         skipn = self._skipped_count()
-        if "Canceled" in self.status.text():
-            pass                                          # canceled by the user
+        if self._canceled:                                # user pressed Cancel: NOT a failure, even though
+            self.status.setText("Canceled.")             # the kill gives a nonzero exit and a late
+            #                                             # heartbeat/buffered line may have overwritten the text
         elif code == 0:
             self._stage_idx = len(self._stages)           # mark every stage done (✓)
             self._render_stepper()

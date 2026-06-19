@@ -49,6 +49,8 @@ class CoarseIndex:
         if self._global_index is None or self._global_index.ntotal == 0:
             return []
         q = np.ascontiguousarray(np.asarray(vec, dtype=np.float32).reshape(1, -1))
+        if q.shape[1] != self.dim:                 # §2 boundary guard: a dim-0 (un-embeddable file)
+            return []                              # or mismatched query would trip faiss' assert -> skip
         kk = min(int(k), self._global_index.ntotal)
         scores, idx = self._global_index.search(q, kk)
         return [(self.global_paths[i], float(s))
@@ -84,8 +86,8 @@ class CoarseIndex:
         wv = np.asarray(window_vecs, dtype=np.float32)
         if wv.ndim == 1:
             wv = wv.reshape(1, -1)
-        if wv.size == 0:
-            return set()
+        if wv.size == 0 or wv.shape[1] != self.dim:   # §2 boundary guard: skip a dim-mismatched query
+            return set()                              # rather than trip faiss' `assert d == self.d`
         kk = min(int(k), self._window_index.ntotal)
         _, idx = self._window_index.search(np.ascontiguousarray(wv), kk)
         return {self.window_owners[i] for row in idx for i in row if i >= 0}

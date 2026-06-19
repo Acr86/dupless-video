@@ -55,6 +55,19 @@ class Embedder:
         if self.fp8 and self._device == "cuda" and not self._try_enable_fp8():
             self.fp8 = False                            # low fidelity -> reverted to fp16
 
+    def free_cache(self) -> None:
+        """Release torch's CACHED-but-unused CUDA blocks back to the driver (the model stays resident).
+        A long-lived watcher would otherwise hold its PEAK VRAM footprint forever between cycles; freeing
+        when the library goes idle returns that memory to the system instead of squatting the GPU. No-op
+        on CPU, and never raises (freeing cache must not break a cycle)."""
+        if getattr(self, "_device", None) != "cuda":
+            return
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:                              # noqa: BLE001 best-effort housekeeping
+            pass
+
     def _load_model(self):
         """Load the DINOv2 backbone. OFFLINE (frozen/installed app): from the vendored repo with
         source='local' + TORCH_HOME at the bundle -> zero network. DEV (no bundle): normal online

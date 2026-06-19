@@ -20,7 +20,7 @@ from concurrent.futures import (
 )
 from dataclasses import asdict
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional
 
 from dupdetect.config import Thresholds
 from dupdetect.features.audio_fp import AUDIO_COV_TOL, AUDIO_OK_COVERAGE
@@ -333,13 +333,32 @@ def _classify(verdict, a, b, reason, conf, review, editions) -> None:
         editions.append((a, b, reason))
 
 
+def _on_disk(p: str, seen: dict[str, bool]) -> bool:
+    """§0 'detect, don't trust' guard against a CONCURRENT deletion. The coarse index is an in-memory
+    SNAPSHOT taken at scan start, so a file the user trashes MID-SCAN still produces candidate pairs
+    that would RESURRECT the `matches` row the UI just forgot (actions.delete_files -> forget_file).
+    Never (re)persist a match for a path that has left the disk -> the user's deletion wins the race.
+    Memoized per scan: at most one stat() per path, and stat hits the MFT (cheap, cached)."""
+    if p not in seen:
+        seen[p] = os.path.exists(p)
+    return seen[p]
+
+
+def _both_on_disk(a: str, b: str, seen: dict[str, bool]) -> bool:
+    """Both endpoints of a candidate pair still on disk -> safe to (re)persist the match (see _on_disk)."""
+    return _on_disk(a, seen) and _on_disk(b, seen)
+
+
 def _pass2_parallel(paths, store, index, th, workers, progress):
     review: list = []
     editions: list = []
+    ondisk: dict[str, bool] = {}                   # §0 concurrent-deletion guard memo
     if progress:
         tqdm.write(f"Pass 2: matching candidate pairs on {workers} workers…")
     for a, b, vval, conf, reason, ad_off, aj, vj, sj in match_pairs_parallel(
             paths, store, index, th, workers, progress=progress):
+        if not _both_on_disk(a, b, ondisk):        # a copy was trashed mid-scan -> don't resurrect it
+            continue
         store.save_match(a, b, vval, conf, reason, ad_offset_s=ad_off,
                          audio_json=json.dumps(aj), video_json=json.dumps(vj),
                          scenes_json=json.dumps(sj))
@@ -347,27 +366,37 @@ def _pass2_parallel(paths, store, index, th, workers, progress):
     return review, editions
 
 
+def _persist_match(store, src: str, res, review, editions) -> None:
+    """Persist ONE match result (C3 ad_offset + audio/video/scenes JSON) and route it into the
+    review/editions queues. Extracted to keep `_pass2_sequential`'s loop flat."""
+    store.save_match(
+        src, res.candidate_path, res.verdict.value, res.confidence, res.reason,
+        ad_offset_s=(res.video.offset if res.video else None),   # C3
+        audio_json=json.dumps(asdict(res.audio)) if res.audio else "",
+        video_json=json.dumps(asdict(res.video)) if res.video else "",
+        scenes_json=json.dumps(asdict(res.scenes)) if res.scenes else "",
+    )
+    _classify(res.verdict, src, res.candidate_path, res.reason, res.confidence, review, editions)
+
+
 def _pass2_sequential(paths, store, index, th, cache, progress):
     review: list = []
     editions: list = []
     evaluated: set[tuple[str, str]] = set()        # C2: a pair is evaluated/acted on once
+    ondisk: dict[str, bool] = {}                   # §0 concurrent-deletion guard memo
     bar2 = tqdm(paths, desc="Pass 2 (duplicates)", unit="film",
                 disable=not progress, dynamic_ncols=True)
     for p in bar2:
+        if not _on_disk(p, ondisk):                # source trashed mid-scan -> skip (don't resurrect)
+            continue
         rec = store.load(p, with_embeddings=False)
         if rec is None:                            # skipped in pass 1 (unreadable)
             continue
         bar2.set_postfix_str(f"review={len(review)} | {_short(p)}")
         for res in match(rec, store, index, th, cache=cache, seen=evaluated):
-            store.save_match(
-                p, res.candidate_path, res.verdict.value, res.confidence, res.reason,
-                ad_offset_s=(res.video.offset if res.video else None),   # C3
-                audio_json=json.dumps(asdict(res.audio)) if res.audio else "",
-                video_json=json.dumps(asdict(res.video)) if res.video else "",
-                scenes_json=json.dumps(asdict(res.scenes)) if res.scenes else "",
-            )
-            _classify(res.verdict, p, res.candidate_path, res.reason, res.confidence,
-                      review, editions)
+            if not _both_on_disk(p, res.candidate_path, ondisk):   # candidate trashed mid-scan -> skip
+                continue
+            _persist_match(store, p, res, review, editions)
     return review, editions
 
 
@@ -393,10 +422,32 @@ def _apply_name_grouping(store: FingerprintStore, th: Thresholds) -> None:
 _DUPLICATE_VALUES = {v.value for v in DUPLICATE_VERDICTS}
 
 
-def _rebuild_clusters(store: FingerprintStore, th: Thresholds) -> list[dict]:
+def _snapshot_clusters(store: FingerprintStore) -> dict:
+    """Map the CURRENT clusters by membership signature -> (keep_path, {path: rank_reason}). Lets a
+    removal-only reconcile reuse the ranking of clusters whose membership didn't change, skipping the
+    expensive rank_cluster (whisper + whole-file audio). Captured BEFORE the forgets so an affected
+    cluster's pre-removal signature no longer matches its (smaller) rebuilt group -> it re-ranks."""
+    by_cid: dict = {}
+    for r in store.conn.execute("SELECT cluster_id, path, is_keep, rank_reason FROM clusters"):
+        ent = by_cid.setdefault(r["cluster_id"], {"paths": set(), "keep": None, "reasons": {}})
+        ent["paths"].add(r["path"])
+        ent["reasons"][r["path"]] = r["rank_reason"] or ""
+        if r["is_keep"]:
+            ent["keep"] = r["path"]
+    return {frozenset(e["paths"]): (e["keep"], e["reasons"]) for e in by_cid.values()}
+
+
+def _rebuild_clusters(store: FingerprintStore, th: Thresholds, reuse: Optional[dict] = None) -> list[dict]:
     """A5: clusters = derived view of the GLOBAL `matches` graph (not the yields of
     this run). Rebuilds the full table -> a re-scan leaves no stale clusters
-    dangling (a path in two clusters). Union-find over all duplicate pairs."""
+    dangling (a path in two clusters). Union-find over all duplicate pairs.
+
+    `reuse` (a `_snapshot_clusters` map taken BEFORE a removal): a rebuilt group whose membership is
+    unchanged keeps its persisted KEEP/rank_reason instead of re-running rank_cluster — so deleting a
+    file only re-ranks the clusters it actually touched, not the whole library. NOT passed by
+    full_scan / ingest, where a member's data may have changed (re-encode) and ranking must be fresh.
+    The union-find still runs in full (cheap), so a removed hub correctly SPLITS its cluster."""
+    reuse = reuse or {}
     uf = UnionFind()
     for a, b, verdict in store.all_matches():
         if verdict in _DUPLICATE_VALUES:
@@ -406,7 +457,13 @@ def _rebuild_clusters(store: FingerprintStore, th: Thresholds) -> list[dict]:
     for cid, members in enumerate(uf.groups().values()):
         if len(members) <= 1:
             continue
-        ranked = rank_cluster(members, store, th)
+        cached = reuse.get(frozenset(members))
+        if cached is not None:                     # membership unchanged -> reuse ranking (no whisper/audio)
+            keep, reasons = cached
+            ranked = {"keep": keep, "discard": [m for m in members if m != keep],
+                      "evidence": reasons, "audio_warning": False}
+        else:
+            ranked = rank_cluster(members, store, th)
         for m in members:
             store.save_cluster(cid, m, is_keep=(m == ranked["keep"]),
                                rank_reason=ranked["evidence"].get(m, ""))
@@ -424,22 +481,12 @@ def _exact_worker(path: str):
     return (path, st.st_mtime, st.st_size, content_hash(path), ffprobe(path))
 
 
-def exact_scan(targets, store: FingerprintStore, th: Thresholds, workers: int = 8,
-               recursive: bool = True, max_height: int | None = None,
-               progress: bool = False) -> dict:
-    """'Exact-only' mode: detects BYTE-IDENTICAL duplicates by content_hash, WITHOUT the expensive
-    pass (no decode/embed/audio/whisper). ~0.1s/file vs ~12s. Reuses the hash of already-indexed
-    files (incremental, doesn't clobber full records) and saves LITE records for the new ones
-    (the UI shows them; a FULL scan later re-indexes them). Rebuilds the clusters from the hash
-    groups."""
-    paths = collect_videos(targets, recursive=recursive)
-    excluded: list[str] = []
-    if max_height:
-        paths, excluded = filter_by_height(paths, max_height, workers)
-
+def _partition_by_hash(paths, store) -> tuple[dict, list[str]]:
+    """Split paths into already-hashed (folded into `by_hash`, reusing the stored hash when the file
+    is unchanged -> incremental) and `todo` (new/changed -> still need hashing)."""
     by_hash: dict[tuple, list[str]] = {}                  # (hash, size) -> identical paths
     todo: list[str] = []
-    for p in paths:                                       # reuse hash if the file didn't change
+    for p in paths:
         try:
             st = os.stat(p)
         except OSError:
@@ -449,7 +496,13 @@ def exact_scan(targets, store: FingerprintStore, th: Thresholds, workers: int = 
             by_hash.setdefault((h, st.st_size), []).append(p)
         else:
             todo.append(p)
+    return by_hash, todo
 
+
+def _hash_exact(todo, store, by_hash, workers, progress) -> list[tuple[str, str]]:
+    """Hash the new/changed files (ProcessPool when workers>1, else serial), folding each into
+    `by_hash` and saving its LITE record. RESILIENT: a corrupt file is skipped-and-reported, never
+    aborts the scan (§2). Returns [(path, error)]."""
     skipped: list[tuple[str, str]] = []
     bar = tqdm(total=len(todo), desc="Hashing (exact only)", unit="file",
                disable=not progress, dynamic_ncols=True)
@@ -476,8 +529,19 @@ def exact_scan(targets, store: FingerprintStore, th: Thresholds, workers: int = 
                 skipped.append((p, str(e))); store.save_problem(p, str(e))
             bar.update(1)
     bar.close()
+    return skipped
 
-    # clusters = byte-identical groups (same hash+size, >1 copy)
+
+def _build_exact_clusters(by_hash, store, th) -> list[dict]:
+    """Rebuild the clusters from byte-identical groups (same hash+size, >1 copy) and stamp each pair
+    with the T0 CERTAIN verdict.
+
+    M1: stamp the T0 verdict so each byte-identical pair reads as CERTAIN, not 'Review only'.
+    exact_scan builds clusters but historically never wrote `matches`, so the verdict was empty and
+    the two tables drifted (ui.data.drift_report). Members share (hash, size) -> the T0 tier holds by
+    construction. Star topology (a representative linked to every other copy) is O(N); skip a pair
+    that already carries a content verdict so a prior full-scan T1 is not clobbered (mirrors the
+    has_match rule)."""
     store.clear_clusters()
     groups = [(k, v) for k, v in by_hash.items() if len(v) > 1]
     clusters_out = []
@@ -486,29 +550,69 @@ def exact_scan(targets, store: FingerprintStore, th: Thresholds, workers: int = 
         for m in members:
             store.save_cluster(cid, m, is_keep=(m == ranked["keep"]),
                                rank_reason=ranked["evidence"].get(m, ""))
-        # M1: stamp the T0 verdict so each byte-identical pair reads as CERTAIN, not 'Review
-        # only'. exact_scan builds clusters but historically never wrote `matches`, so the
-        # verdict was empty and the two tables drifted (ui.data.drift_report). Members share
-        # (hash, size) -> the T0 tier holds by construction. Star topology (a representative
-        # linked to every other copy) is O(N); skip a pair that already carries a content
-        # verdict so a prior full-scan T1 is not clobbered (mirrors the has_match rule).
         hub = ranked["keep"] or members[0]
         for m in members:
             if m != hub and not store.has_match(hub, m):
                 store.save_match(hub, m, Verdict.CERTAIN.value, 1.00, T0_REASON)
         clusters_out.append({"cluster_id": cid, **ranked})
+    return clusters_out
 
+
+def exact_scan(targets, store: FingerprintStore, th: Thresholds, workers: int = 8,
+               recursive: bool = True, max_height: int | None = None,
+               progress: bool = False) -> dict:
+    """'Exact-only' mode: detects BYTE-IDENTICAL duplicates by content_hash, WITHOUT the expensive
+    pass (no decode/embed/audio/whisper). ~0.1s/file vs ~12s. Reuses the hash of already-indexed
+    files (incremental, doesn't clobber full records) and saves LITE records for the new ones
+    (the UI shows them; a FULL scan later re-indexes them). Rebuilds the clusters from the hash
+    groups."""
+    paths = collect_videos(targets, recursive=recursive)
+    excluded: list[str] = []
+    if max_height:
+        paths, excluded = filter_by_height(paths, max_height, workers)
+    by_hash, todo = _partition_by_hash(paths, store)
+    skipped = _hash_exact(todo, store, by_hash, workers, progress)
+    clusters_out = _build_exact_clusters(by_hash, store, th)
     return {"clusters": clusters_out, "review_queue": [], "editions": [],
             "skipped": skipped, "excluded_by_height": excluded}
 
 
+def _prepended_ad(r, member: str, min_ad_s: float) -> bool:
+    """PREPENDED ads: an alignment offset (C3; offset>0 => b_path starts later, ads at b's head)
+    larger than `min_ad_s` on the side `member` is on."""
+    off = r["ad_offset_s"]
+    if off is None:
+        return False
+    return (r["b_path"] == member and off > min_ad_s) or (r["a_path"] == member and off < -min_ad_s)
+
+
+def _midroll_ad(r, member: str, th: Thresholds) -> bool:
+    """MID-ROLL ads: foreign blocks spliced INSIDE the content (AlignResult.interleaved_ratio +
+    ad_dir, measured 2026-06-12). ad_dir points at the LONGER (ad) copy."""
+    vj = r["video_json"]
+    if not (vj and th.ad_interleaved_min > 0):
+        return False
+    try:
+        d = json.loads(vj)
+    except (ValueError, TypeError):
+        return False
+    if (d.get("interleaved_ratio") or 0.0) < th.ad_interleaved_min:
+        return False
+    adir = d.get("ad_dir") or 0
+    return (r["b_path"] == member and adir == 1) or (r["a_path"] == member and adir == -1)
+
+
+def _row_marks_ads(r, member: str, th: Thresholds, min_ad_s: float) -> bool:
+    """Does ONE match row mark `member` as the ad-carrying copy? (prepended OR mid-roll). Extracted
+    to keep `_cluster_has_ads` flat; verdict is untouched, this only steers KEEP."""
+    return _prepended_ad(r, member, min_ad_s) or _midroll_ad(r, member, th)
+
+
 def _cluster_has_ads(store: FingerprintStore, member: str, cluster: set[str], th: Thresholds,
                      min_ad_s: float = 5.0) -> bool:
-    """Does `member` carry inserted commercials relative to another cluster member? Two shapes:
-      - PREPENDED ads: an alignment offset (C3; offset>0 => b_path starts later, ads at b's head).
-      - MID-ROLL ads: foreign blocks spliced INSIDE the content (AlignResult.interleaved_ratio +
-        ad_dir, measured 2026-06-12). ad_dir points at the LONGER (ad) copy. Verdict is untouched —
-        the ad copy stays a duplicate; this only steers KEEP to the clean copy and flags which is which."""
+    """Does `member` carry inserted commercials relative to another cluster member? Verdict is
+    untouched — the ad copy stays a duplicate; this only steers KEEP to the clean copy and flags
+    which is which. Per-row detection (prepended / mid-roll) lives in `_row_marks_ads`."""
     rows = store.conn.execute(
         "SELECT a_path, b_path, ad_offset_s, video_json FROM matches WHERE a_path=? OR b_path=?",
         (member, member),
@@ -516,21 +620,8 @@ def _cluster_has_ads(store: FingerprintStore, member: str, cluster: set[str], th
     for r in rows:
         if r["a_path"] not in cluster or r["b_path"] not in cluster:
             continue
-        off = r["ad_offset_s"]
-        if off is not None and (
-                (r["b_path"] == member and off > min_ad_s) or (r["a_path"] == member and off < -min_ad_s)):
+        if _row_marks_ads(r, member, th, min_ad_s):
             return True
-        vj = r["video_json"]
-        if vj and th.ad_interleaved_min > 0:
-            try:
-                d = json.loads(vj)
-            except (ValueError, TypeError):
-                d = {}
-            ratio = d.get("interleaved_ratio") or 0.0
-            adir = d.get("ad_dir") or 0
-            if ratio >= th.ad_interleaved_min and (
-                    (r["b_path"] == member and adir == 1) or (r["a_path"] == member and adir == -1)):
-                return True
     return False
 
 
@@ -559,6 +650,63 @@ def _ensure_lang(rec, store: FingerprintStore, th: Thresholds) -> None:
         store.set_lang(rec.path, lang)
 
 
+def _score_member(m: str, store: FingerprintStore, th: Thresholds, wanted: set, cluster: set):
+    """Score ONE cluster member by QUALITY (not identity): wanted language >> RESOLUTION >> no ads
+    >> lower cam >> higher bitrate, minus clipping. Returns (score, m, rec, lang_ok, pixels, br,
+    has_ads). Deferred whisper + on-demand audio coverage are ensured here (only members pay for it),
+    mutating the loaded rec so the audio/keep logic reads the real value."""
+    rec = store.load(m, with_embeddings=False)
+    _ensure_lang(rec, store, th)                   # deferred whisper: only cluster members need it
+    rec.quality.audio_coverage = ensure_audio_coverage(
+        m, store, rec.probe.duration_s, bool(rec.probe.audio_tracks))
+    pixels = (rec.probe.width or 0) * (rec.probe.height or 0)
+    br = rec.probe.bitrate_kbps or 0
+    lang_ok = rec.quality.lang_detected in wanted
+    has_ads = _cluster_has_ads(store, m, cluster, th)
+    score = (
+        (1_000_000_000 if lang_ok else 0)          # wanted language: dominant
+        + pixels                                   # resolution: robust, dominates the rest
+        - (500_000 if has_ads else 0)              # ads: penalize (removable)
+        - rec.quality.cam_score * 100_000          # cam: weak signal
+        - th.color_clip_keep_weight * rec.quality.color.clip   # clipping: destroyed detail
+        #                                          # -> prefer the least-clipped copy (the original)
+        + br                                       # bitrate: fine tiebreak
+    )
+    return (score, m, rec, lang_ok, pixels, br, has_ads)
+
+
+def _color_adjusted_keep(keep, scored):
+    """Color divergence (a copy was re-graded, e.g. a bad auto color-correct): the quality score can
+    pick a higher-res re-grade that CLIPPED detail (crushed blacks). When the grade diverges, prefer
+    the LEAST-CLIPPED copy (the preserved/original look) — but ONLY when the score-winner clips
+    SIGNIFICANTLY more, so a trivial clip edge never downgrades a real resolution upgrade (a 1080p
+    @0% clip must not beat a genuine 4K @1% clip; measured: original ~1% vs bad re-grade ~26% ->
+    CLIP_DOWNGRADE_MARGIN). No-op when keep is None (audio guard already sent it to review)."""
+    if keep is None or not _color_diverges(scored):
+        return keep
+    least = min(scored, key=lambda t: t[2].quality.color.clip)
+    if scored[0][2].quality.color.clip - least[2].quality.color.clip > CLIP_DOWNGRADE_MARGIN:
+        return least[1]
+    return keep
+
+
+def _rank_evidence(scored, keep) -> dict:
+    """Human-readable per-member evidence (KEEP/discard/review + lang/res/bitrate/cam/ads/audio)."""
+    def role(m: str) -> str:
+        if m == keep:
+            return "KEEP"
+        return "review" if keep is None else "discard"
+    return {
+        m: "%s: lang=%s%s, %dx%d, %dkbps, cam=%.2f%s%s" % (
+            role(m),
+            rec.quality.lang_detected or "?", " (wanted)" if lang_ok else "",
+            rec.probe.width or 0, rec.probe.height or 0, br, rec.quality.cam_score,
+            ", ads" if has_ads else "",
+            _audio_note(rec.quality.audio_coverage, rec.probe.duration_s))
+        for _, m, rec, lang_ok, _, br, has_ads in scored
+    }
+
+
 def rank_cluster(members: list[str], store: FingerprintStore, th: Thresholds) -> dict:
     """Ranks members by QUALITY (not identity) and marks the 'keep'.
 
@@ -569,30 +717,7 @@ def rank_cluster(members: list[str], store: FingerprintStore, th: Thresholds) ->
     """
     wanted = set(th.raw["quality"]["wanted_langs"])
     cluster = set(members)
-    scored = []
-    for m in members:
-        rec = store.load(m, with_embeddings=False)
-        _ensure_lang(rec, store, th)               # deferred whisper: only cluster members need it
-        # ON-DEMAND audio coverage (deferred out of Pass-1): ensure it for cluster members so the
-        # KEEP/audio-warning decision is correct (never keep the muted copy by mistake). Cheap +
-        # cached -> reused next run. Mutate the loaded rec so the audio logic below reads the real value.
-        rec.quality.audio_coverage = ensure_audio_coverage(
-            m, store, rec.probe.duration_s, bool(rec.probe.audio_tracks))
-        pixels = (rec.probe.width or 0) * (rec.probe.height or 0)
-        br = rec.probe.bitrate_kbps or 0
-        lang_ok = rec.quality.lang_detected in wanted
-        has_ads = _cluster_has_ads(store, m, cluster, th)
-        score = (
-            (1_000_000_000 if lang_ok else 0)        # wanted language: dominant
-            + pixels                                 # resolution: robust, dominates the rest
-            - (500_000 if has_ads else 0)            # ads: penalize (removable)
-            - rec.quality.cam_score * 100_000        # cam: weak signal
-            - th.color_clip_keep_weight * rec.quality.color.clip   # clipping: destroyed detail
-            #                                        # -> prefer the least-clipped copy (the original)
-            + br                                     # bitrate: fine tiebreak
-        )
-        scored.append((score, m, rec, lang_ok, pixels, br, has_ads))
-
+    scored = [_score_member(m, store, th, wanted, cluster) for m in members]
     # Final tiebreak: SHORTEST PATH. Among equivalent copies keep the original
     # ('movie.avi' over 'movie (1).avi') and prefer the shortest-path location.
     scored.sort(key=lambda t: (t[0], -len(t[1])), reverse=True)
@@ -603,35 +728,9 @@ def rank_cluster(members: list[str], store: FingerprintStore, th: Thresholds) ->
     covs = [rec.quality.audio_coverage for _s, _m, rec, *_ in scored]
     audio_bad = any(c < AUDIO_OK_COVERAGE for c in covs) and (max(covs) - min(covs)) > AUDIO_COV_TOL
     keep = None if audio_bad else scored[0][1]
-    # Color divergence (a copy was re-graded, e.g. a bad auto color-correct): the score above can
-    # pick a higher-res re-grade that CLIPPED detail (crushed blacks). When the grade diverges,
-    # prefer the LEAST-CLIPPED copy (the preserved/original look) as the suggestion; the UI also
-    # flags '⚠ color differs' so the user can override. Audio warning still takes precedence.
-    if keep is not None and _color_diverges(scored):
-        # Prefer the least-clipped copy (the preserved/original look) ONLY when the score-winner
-        # clips SIGNIFICANTLY more — i.e. a higher-res copy that actually DESTROYED detail (crushed
-        # blacks / bad upscale). A trivial clip edge must NOT downgrade a real resolution upgrade
-        # (a 1080p @0% clip must never beat a genuine 4K @1% clip). Measured: original ~1% vs bad
-        # re-grade ~26% -> CLIP_DOWNGRADE_MARGIN separates noise from destroyed detail.
-        least = min(scored, key=lambda t: t[2].quality.color.clip)
-        if scored[0][2].quality.color.clip - least[2].quality.color.clip > CLIP_DOWNGRADE_MARGIN:
-            keep = least[1]
-
-    def role(m: str) -> str:
-        if m == keep:
-            return "KEEP"
-        return "review" if keep is None else "discard"
-    evidence = {
-        m: "%s: lang=%s%s, %dx%d, %dkbps, cam=%.2f%s%s" % (
-            role(m),
-            rec.quality.lang_detected or "?", " (wanted)" if lang_ok else "",
-            rec.probe.width or 0, rec.probe.height or 0, br, rec.quality.cam_score,
-            ", ads" if has_ads else "",
-            _audio_note(rec.quality.audio_coverage, rec.probe.duration_s))
-        for _, m, rec, lang_ok, _, br, has_ads in scored
-    }
+    keep = _color_adjusted_keep(keep, scored)      # re-grade clipped detail -> prefer the original look
     return {"keep": keep, "discard": [m for _, m, *_ in scored if m != keep],
-            "evidence": evidence, "audio_warning": audio_bad}
+            "evidence": _rank_evidence(scored, keep), "audio_warning": audio_bad}
 
 
 def _audio_note(cov: float, duration_s: float) -> str:

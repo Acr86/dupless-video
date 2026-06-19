@@ -169,9 +169,10 @@ class WatchPanel(QGroupBox):
         if not self.is_watching():
             return
         self._spin = (self._spin + 1) % len(_SPIN)
-        mm, ss = divmod(int(time.monotonic() - self._t0), 60)
+        from dupdetect.util import fmt_duration
+        up = fmt_duration(time.monotonic() - self._t0)   # H:MM:SS, days past 24h (was MM:SS -> overflowed)
         self.status.setText(
-            f"{_SPIN[self._spin]} Watching · {self._mode} · {self._last} · alive {mm:02d}:{ss:02d}")
+            f"{_SPIN[self._spin]} Watching · {self._mode} · {self._last} · up {up}")
 
     def _finished(self, code: int = 0, _status=None):
         self._hb.stop()                                    # stop the heartbeat; the watcher is no longer alive

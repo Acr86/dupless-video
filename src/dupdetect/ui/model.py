@@ -7,7 +7,8 @@ import os
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QBrush, QColor, QStandardItem, QStandardItemModel
 
-from dupdetect.ui.data import ClusterRow, cluster_tooltip, is_actionable
+from dupdetect.store.store import MIN_CLUSTER_MEMBERS
+from dupdetect.ui.data import ClusterRow, FileRow, cluster_tooltip, is_actionable
 
 PATH_ROLE = Qt.UserRole + 1
 SIZE_ROLE = Qt.UserRole + 2
@@ -22,6 +23,55 @@ def _gb(n: int) -> str:
     return f"{n/1e9:.1f} GB" if n >= 1e9 else f"{n/1e6:.0f} MB"
 
 
+def _head_cells(cl: ClusterRow) -> list[QStandardItem]:
+    """The cluster HEADER row: title · copies · reclaim · verdict (+ audio/color warnings), with a
+    hover tooltip (explaining the ⚠) on every cell so the whole row shows the same text."""
+    warn = "" if is_actionable(cl) else "⚠ "
+    audio_tag = "  ·  ⚠ audio differs — pick KEEP manually" if cl.audio_warning else ""
+    color_tag = "  ·  ⚠ color differs — verify (KEEP = least clipped)" if cl.color_warning else ""
+    head = QStandardItem(
+        f"{warn}{cl.title}   ·   {cl.n_copies} copies · reclaim {_gb(cl.reclaimable_bytes)} "
+        f"· {cl.verdict}{audio_tag}{color_tag}")
+    head.setEditable(False)
+    head.setData("cluster", KIND_ROLE)
+    head.setData(cl.cluster_id, PATH_ROLE)
+    tip = cluster_tooltip(cl)
+    cells = [head] + [QStandardItem("") for _ in range(len(HEADERS) - 1)]
+    for c in cells:
+        c.setEditable(False)
+        c.setToolTip(tip)
+    return cells
+
+
+def _member_label(m: FileRow, cl: ClusterRow) -> str:
+    """Display text for a file row: ★/⚠ markers, audio note, color clip %, and the (KEEP) suffix."""
+    mark = f"⚠ {m.name}  ({m.audio_note})" if m.audio_bad else m.name
+    if cl.color_warning:                                # show clipping so the user sees the suggestion
+        mark = f"{mark}  · clip {m.color.clip * 100:.0f}%"
+    if m.is_keep:
+        return f"★ {mark}  (KEEP)"
+    return mark
+
+
+def _member_row(m: FileRow, cl: ClusterRow, checked: set[str]) -> list[QStandardItem]:
+    """One file row under a cluster head: checkable EXCEPT the KEEP (safety lock — never deletable)."""
+    name = QStandardItem(_member_label(m, cl))
+    name.setEditable(False)
+    name.setData(m.path, PATH_ROLE)
+    name.setData(m.size, SIZE_ROLE)
+    name.setData(m.is_keep, KEEP_ROLE)
+    name.setData("file", KIND_ROLE)
+    if m.audio_bad:                                     # explain the per-file ⚠ on hover
+        name.setToolTip(f"⚠ {m.audio_note} — likely a muted or truncated rip; "
+                        "prefer keeping a copy with full audio.")
+    if m.is_keep:
+        name.setCheckable(False)
+    else:
+        name.setCheckable(True)
+        name.setCheckState(Qt.Checked if m.path in checked else Qt.Unchecked)
+    return [name, _ro(m.res), _ro(_gb(m.size)), _ro(m.vcodec), _ro(m.lang), _ro(m.path)]
+
+
 def build_model(clusters: list[ClusterRow],
                 checked: set[str] | None = None) -> QStandardItemModel:
     """Builds the tree model. `clusters` arrive already sorted/filtered.
@@ -32,44 +82,10 @@ def build_model(clusters: list[ClusterRow],
     model.setHorizontalHeaderLabels(HEADERS)
     root = model.invisibleRootItem()
     for cl in clusters:
-        warn = "" if is_actionable(cl) else "⚠ "
-        audio_tag = "  ·  ⚠ audio differs — pick KEEP manually" if cl.audio_warning else ""
-        color_tag = "  ·  ⚠ color differs — verify (KEEP = least clipped)" if cl.color_warning else ""
-        head = QStandardItem(
-            f"{warn}{cl.title}   ·   {cl.n_copies} copies · reclaim {_gb(cl.reclaimable_bytes)} "
-            f"· {cl.verdict}{audio_tag}{color_tag}")
-        head.setEditable(False)
-        head.setData("cluster", KIND_ROLE)
-        head.setData(cl.cluster_id, PATH_ROLE)
-        tip = cluster_tooltip(cl)                        # explains the ⚠ on hover (first-time users)
-        cells = [head] + [QStandardItem("") for _ in range(len(HEADERS) - 1)]
-        for c in cells:
-            c.setEditable(False)
-            c.setToolTip(tip)                            # whole header row -> same hover text
+        cells = _head_cells(cl)
+        head = cells[0]
         for m in cl.members:
-            star = "★ " if m.is_keep else ""
-            name = QStandardItem(f"{star}{m.name}")
-            name.setEditable(False)
-            name.setData(m.path, PATH_ROLE)
-            name.setData(m.size, SIZE_ROLE)
-            name.setData(m.is_keep, KEEP_ROLE)
-            name.setData("file", KIND_ROLE)
-            mark = f"⚠ {m.name}  ({m.audio_note})" if m.audio_bad else m.name
-            if m.audio_bad:                             # explain the per-file ⚠ on hover
-                name.setToolTip(f"⚠ {m.audio_note} — likely a muted or truncated rip; "
-                                "prefer keeping a copy with full audio.")
-            if cl.color_warning:                        # show clipping so the user sees the suggestion
-                mark = f"{mark}  · clip {m.color.clip * 100:.0f}%"
-            if m.is_keep:
-                name.setCheckable(False)                # KEEP: never deletable
-                name.setText(f"★ {mark}  (KEEP)")
-            else:
-                name.setText(f"{star}{mark}")
-                name.setCheckable(True)
-                name.setCheckState(Qt.Checked if m.path in checked else Qt.Unchecked)
-            cols = [name,
-                    _ro(m.res), _ro(_gb(m.size)), _ro(m.vcodec), _ro(m.lang), _ro(m.path)]
-            head.appendRow(cols)
+            head.appendRow(_member_row(m, cl, checked))
         root.appendRow(cells)
     return model
 
@@ -78,6 +94,32 @@ def _ro(text: str) -> QStandardItem:
     it = QStandardItem(str(text))
     it.setEditable(False)
     return it
+
+
+def remove_paths(model: QStandardItemModel, paths: set[str]) -> int:
+    """Removes file rows whose path is in `paths` from the duplicate tree IN PLACE, then drops any
+    cluster head left with fewer than 2 file children (a singleton is no longer a duplicate group —
+    mirrors store.prune_singleton_clusters). Returns the number of cluster heads removed.
+
+    Pure VIEW surgery used after an in-app delete so the list updates INSTANTLY without a DB reload
+    that could race a concurrent scan (the store was already updated by actions.delete_files). Walks
+    bottom-up so a removed row never shifts an index still in use."""
+    if not paths:
+        return 0
+    root = model.invisibleRootItem()
+    removed_heads = 0
+    for i in range(root.rowCount() - 1, -1, -1):
+        head = root.child(i)
+        if head is None or head.data(KIND_ROLE) != "cluster":
+            continue
+        for j in range(head.rowCount() - 1, -1, -1):
+            child = head.child(j)
+            if child is not None and child.data(PATH_ROLE) in paths:
+                head.removeRow(j)
+        if head.rowCount() < MIN_CLUSTER_MEMBERS:    # singleton -> no longer a duplicate group
+            root.removeRow(i)
+            removed_heads += 1
+    return removed_heads
 
 
 def checked_files(model: QStandardItemModel) -> list[tuple[str, int]]:

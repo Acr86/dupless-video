@@ -114,6 +114,12 @@ def build_record(cpu: CpuFeatures, emb: np.ndarray, times: np.ndarray, color: Co
     """Combines CPU features + GPU embeddings into a Record. In mode B derives scene cuts
     from embeddings using the REAL keyframe timestamps (`times`). `color` is measured from the
     same decoded keyframes (reused) -> helps pick the KEEP / flag color divergence."""
+    # No keyframes decoded -> empty embedding. Surface the file as a PROBLEM (Pass-1's caller catches
+    # this and calls save_problem -> it shows in the Problems tab) instead of persisting a useless
+    # record with a degenerate/empty global_vec: that record neither reflects the file's real status
+    # nor can be matched (and would crash faiss' coarse query). §2 skip-and-report.
+    if emb is None or getattr(emb, "size", 0) == 0:
+        raise RuntimeError("no decodable video frames — cannot compute an embedding")
     quality = Quality(lang_detected=cpu.lang_detected, cam_score=cpu.cam_score_partial,
                       audio_coverage=cpu.audio_coverage,   # cheap whole-file coverage (Pass-1)
                       color=color)

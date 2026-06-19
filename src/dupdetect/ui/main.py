@@ -23,7 +23,7 @@ from dupdetect.ui import actions, startup
 from dupdetect.ui.data import clean_title, drift_report, is_actionable, load_clusters, sort_clusters
 from dupdetect.ui.model import (
     KIND_ROLE, PATH_ROLE, build_audio_warning_model, build_model, build_problem_model,
-    checked_files, checked_problems, problem_paths,
+    checked_files, checked_problems, problem_paths, remove_paths,
 )
 from dupdetect.ui.scan_panel import ScanPanel
 from dupdetect.ui.watch_panel import WatchPanel
@@ -260,11 +260,10 @@ class MainWindow(QMainWindow):
         self.refresh()
 
     def _on_watch_dups(self, n: int):
-        """The background watcher reported new duplicate clusters: native toast + refresh the view."""
-        self._tray.showMessage(
-            "Duplicates detected",
-            f"{n} new duplicate group(s) found. Open Dupless Video to review and reclaim space.",
-            QSystemTrayIcon.Information, 8000)
+        """The background watcher found new duplicate clusters: a silent in-app toast + refresh, never
+        an OS/tray notification and never a sound — the app is intentionally silent. When minimized to
+        the tray the toast isn't seen; the refreshed list shows the new groups the next time it opens."""
+        self._toast(f"{n} new duplicate group(s) found.")
         self.refresh()
 
     def _on_watch_cycle(self, indexed: int, removed: int, _new_dups: int):
@@ -338,10 +337,7 @@ class MainWindow(QMainWindow):
 
     def _on_scan_finished(self, db: str):
         self.switch_db(db)
-        self._tray.showMessage(                          # notify even if minimized to the tray
-            "Analysis finished",
-            "Your library scan is done. Open Dupless Video to review duplicates and reclaim space.",
-            QSystemTrayIcon.Information, 8000)
+        self._toast("Analysis finished — your library scan is done.")   # silent; no OS toast
 
     def _update_coverage(self):
         """Permanent badge: how much of the library is FULLY analyzed (has embeddings) vs exact-only.
@@ -619,8 +615,18 @@ class MainWindow(QMainWindow):
         msg = f"Deleted {len(res.deleted)} · freed {_gb(res.freed_bytes)}"
         if res.errors:
             msg += f"\n{len(res.errors)} errors:\n" + "\n".join(f"· {p}: {e}" for p, e in res.errors[:8])
-        self._toast(msg)                                 # silent, non-modal — the list refresh shows the result
-        self.refresh()
+        self._toast(msg)                                 # silent, non-modal
+        # Optimistic, INSTANT view update: drop the deleted rows (and any cluster left a singleton)
+        # from the model in place — the user's own action must feel immediate and must NOT be undone
+        # by a background full-scan rebuilding clusters on the same DB. forget_file already persisted
+        # the removal (stat-guarded so the scan can't resurrect it); this only reconciles the VIEW,
+        # avoiding a load_clusters round-trip that could race the scan's mid-flight cluster rebuild.
+        if res.deleted:
+            remove_paths(self.model, set(res.deleted))
+            self._update_sel()
+            self._update_coverage()
+        else:
+            self.refresh()                               # nothing deleted (all errored) -> reflect state
 
     def _context_menu(self, pos):
         idx = self.tree.indexAt(pos)
@@ -817,13 +823,7 @@ class MainWindow(QMainWindow):
         close_to_tray = self._settings.value("close_to_tray", True, bool)
         if not self._really_quit and close_to_tray and self._tray.isSystemTrayAvailable():
             e.ignore()
-            self.hide()
-            if not self._settings.value("tray_hinted", False, bool):
-                self._tray.showMessage(
-                    "Still running",
-                    "Dupless Video keeps watching in the background. Right-click the tray icon to Quit.",
-                    QSystemTrayIcon.Information, 5000)
-                self._settings.setValue("tray_hinted", True)
+            self.hide()                                     # hide to tray; no OS toast (the app is silent)
             return
         self._save_headers()                            # remember column order+widths across sessions
         self.watch_panel.stop()                         # don't leave the watcher subprocess running
@@ -913,12 +913,9 @@ def run(db_path: str, start_hidden: bool = False) -> int:
 
     server.newConnection.connect(_focus)
     win._single_server = server                         # prevent GC of server
-    # --tray (run-at-login): stay hidden in the tray, watching, instead of popping the window open.
-    # Fall back to showing the window if there is no system tray (so it can't get stuck invisible).
-    if start_hidden and win._tray.isSystemTrayAvailable():
-        win._tray.showMessage(
-            "Dupless Video", "Running in the background — open it from the tray icon.",
-            QSystemTrayIcon.Information, 5000)
-    else:
+    # --tray (run-at-login): stay hidden in the tray, watching, instead of popping the window open
+    # (silently — no OS toast). Fall back to showing the window if there is no system tray (so it
+    # can't get stuck invisible).
+    if not (start_hidden and win._tray.isSystemTrayAvailable()):
         win.show()
     return app.exec()

@@ -359,10 +359,14 @@ def watch(
     import threading
 
     from dupdetect.pipeline.fullscan import exact_scan
-    from dupdetect.watch import CycleResult, start_fs_events, watch_loop, watch_once
+    from dupdetect.watch import (
+        CycleResult, WatchContext, WatchTuning, start_fs_events, watch_loop, watch_once,
+    )
 
     th, store, embedder = _bootstrap(db, config)
     tlist = [str(t) for t in targets]
+    ctx = WatchContext(tlist, store, embedder, th)
+    tuning = WatchTuning(interval=interval, stable_s=stable_s, independent_scenes=independent_scenes)
     typer.echo("Dupless Video watcher — usable right away.")
     typer.echo("  Exact (byte-identical) duplicates show immediately; re-encode/upgrade detection")
     typer.echo("  completes in the background as files are analyzed. Leave it running; open the app")
@@ -389,25 +393,27 @@ def watch(
         typer.echo(f"[{strftime('%H:%M:%S')}] detecting={n} new file(s)…")
 
     if once:
-        res = watch_once(tlist, store, embedder, th, on_duplicate=_notify,
-                         stable_s=stable_s, independent_scenes=independent_scenes)
+        res = watch_once(ctx, tuning, on_duplicate=_notify)
         _cycle(res)
         typer.echo(f"One cycle: indexed={res.indexed} removed={res.removed} "
                    f"dups={len(res.dup_clusters)}")
         return
 
     wake = threading.Event()
-    stop_events = start_fs_events(tlist, wake)              # native FS events (watchdog) if available
+    from collections import deque
+    deleted: deque = deque()                               # exact paths watchdog reports gone -> O(1) forget
+    changed: deque = deque()                               # exact paths created/modified -> fast-lane index
+    stop_events = start_fs_events(tlist, wake, deleted, changed)   # native FS events (watchdog) if available
     if stop_events:
-        typer.echo("Filesystem events: subscribed — instant reaction; polling backs off when idle.")
+        typer.echo("Filesystem events: subscribed — new/changed files fast-lane indexed; "
+                   "deletions reconciled instantly; backlog walked oldest-first.")
     else:
         typer.echo("Filesystem events: watchdog not installed — polling only "
                    "(pip install watchdog for instant reaction).")
     typer.echo("Phase 2/2 — background watch (deep). Ctrl+C to stop.")
     try:
-        watch_loop(tlist, store, embedder, th, interval=interval, on_duplicate=_notify,
-                   on_cycle=_cycle, on_detect=_detect, stable_s=stable_s,
-                   independent_scenes=independent_scenes, wake=wake)
+        watch_loop(ctx, tuning=tuning, on_duplicate=_notify, on_cycle=_cycle,
+                   on_detect=_detect, wake=wake, deleted=deleted, changed=changed)
     except KeyboardInterrupt:
         typer.echo("\nWatcher stopped. The DB is up to date through the last completed cycle.")
     finally:

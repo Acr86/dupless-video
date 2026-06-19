@@ -278,3 +278,23 @@ def test_align_video_pair_empty_torch_tensor_no_crash():
     cache = _DictCache({"/a": _FakeTorchEmpty(), "/b": _FakeTorchEmpty()})
     res = _align_video_pair(ra, rb, cache, load_thresholds())
     assert res.score == 0.0                              # guard catches torch empties -> no matmul
+
+
+def test_build_record_flags_unembeddable_file():
+    """A file with no decodable frames (empty embedding) must RAISE so Pass-1's caller records it as
+    a PROBLEM (Problems tab), instead of persisting a useless record with an empty global_vec that
+    doesn't reflect the file's real status and would crash the coarse matcher."""
+    import numpy as np
+    import pytest as _pytest
+
+    from dupdetect.config import load_thresholds
+    from dupdetect.models import Probe
+    from dupdetect.pipeline.analyze import CpuFeatures, build_record
+
+    cpu = CpuFeatures(path="/x.mp4", mtime=0.0, size=1,
+                      probe=Probe(10.0, 100, 100, "h264", 1000, []), content_hash="h",
+                      audio_fp=np.empty(0, np.uint32), scene_cuts=np.empty(0, np.float32),
+                      lang_detected=None, cam_score_partial=0.0, audio_coverage=None)
+    # the guard is the first statement -> times/color/embedder are irrelevant for this case
+    with _pytest.raises(RuntimeError, match="no decodable"):
+        build_record(cpu, np.zeros((0, 768), np.float16), None, None, None, load_thresholds())

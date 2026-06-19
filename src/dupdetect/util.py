@@ -10,6 +10,31 @@ import subprocess
 # Without this, a scan invoking hundreds of ffmpeg processes would flash hundreds of console windows.
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
+
+def fmt_duration(seconds: float) -> str:
+    """Human duration as `H:MM:SS`, rolling over to `Dd HH:MM:SS` past 24h. For elapsed / uptime /
+    ETA clocks: a 90-minute run must read `1:30:00` (not `90:00`), and a multi-day one `2d 03:15:42`."""
+    s = int(max(0, seconds))
+    d, rem = divmod(s, 86400)
+    h, rem = divmod(rem, 3600)
+    m, sec = divmod(rem, 60)
+    if d:
+        return f"{d}d {h:02d}:{m:02d}:{sec:02d}"
+    return f"{h}:{m:02d}:{sec:02d}"
+
+
+def clock_to_secs(clock: str) -> int:
+    """Parse a colon-separated time (`SS`, `MM:SS`, `H:MM:SS`, `D:HH:MM:SS`) into seconds. Used to
+    re-format tqdm's ETA, which never rolls past hours (51h shows as `51:41:54`). Returns 0 if unparseable."""
+    try:
+        parts = [int(p) for p in clock.strip().split(":")]
+    except ValueError:
+        return 0
+    secs = 0
+    for p in parts:                                    # most-significant first -> accumulate
+        secs = secs * 60 + p
+    return secs
+
 # Rich renders tracebacks inside box-drawing characters; strip them (plus padding) from a line's
 # ends so the exception line can be matched whether or not it sits inside a panel.
 _BOX_CHARS = "│┌┐└┘─╭╮╰╯├┤┬┴┼ \t"

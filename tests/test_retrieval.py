@@ -40,6 +40,25 @@ def test_query_global_empty_index():
     assert idx.query_global(_unit([[1, 0, 0, 0]])[0], k=5) == []
 
 
+def test_query_global_dim_mismatch_skips_not_crashes():
+    """§2 boundary guard: a query whose dim != the index dim (e.g. a dim-0 vector from an
+    un-embeddable file) returns [] instead of tripping faiss' `assert d == self.d` (which would crash
+    the whole Pass-2 batch)."""
+    idx = CoarseIndex(dim=4)
+    idx.build(["/a.mkv"], _unit([[1, 0, 0, 0]]))
+    assert idx.query_global(np.empty(0, dtype=np.float32), k=5) == []        # empty -> dim 0
+    assert idx.query_global(np.zeros(8, dtype=np.float32), k=5) == []        # dim 8 != index dim 4
+
+
+def test_query_windows_dim_mismatch_skips_not_crashes():
+    """Same §2 boundary guard on the window index."""
+    owners = ["/a.mkv", "/a.mkv"]
+    idx = CoarseIndex(dim=4)
+    idx.build(["/a.mkv"], _unit([[1, 0, 0, 0]]),
+              window_owners=owners, window_vecs=_unit([[1, 0, 0, 0], [0, 1, 0, 0]]))
+    assert idx.query_windows(np.zeros((1, 8), dtype=np.float32), k=2) == set()   # dim 8 != 4
+
+
 def test_query_windows_merges_owners():
     # 4 window-vecs: 2 from 'a', 2 from 'b'
     owners = ["/a.mkv", "/a.mkv", "/b.mkv", "/b.mkv"]
@@ -95,3 +114,21 @@ def test_candidate_paths_gates_duration_neighbors_not_topk(monkeypatch):
     monkeypatch.setattr(idx, "query_global", lambda *a, **k: [])     # isolate: only the gated net
     cands = matcher.candidate_paths(rec, store=None, index=idx, th=th)
     assert "/dup.mkv" in cands and "/diff.mkv" not in cands          # low-cosine neighbor pruned
+
+
+def test_candidate_paths_skips_record_without_embedding():
+    """§2: a file Pass-1 couldn't embed (empty global_vec — e.g. no decodable frames) must NOT crash
+    faiss (`assert d == self.d`, dim 0 != index dim) and take the whole Pass-2 batch down with it.
+    candidate_paths returns no candidates, so the file is simply skipped (no matches)."""
+    from dupdetect.config import load_thresholds
+    from dupdetect.match import matcher
+    from dupdetect.models import Probe, Quality, Record
+
+    th = load_thresholds()
+    idx = CoarseIndex(dim=4)
+    idx.build(["/x.mkv"], _unit([[1, 0, 0, 0]]))                     # a real 4-dim index
+    rec = Record(path="/empty.mkv", mtime=0.0, size=1, probe=Probe(100.0, 100, 100, "h264", 1000, []),
+                 content_hash="e", global_vec=np.empty(0, np.float32),   # no embedding -> dim 0
+                 window_vecs=np.zeros((0, 4), np.float32), embeddings=np.zeros((0, 4), np.float16),
+                 audio_fp=np.zeros(0, np.uint32), scene_cuts=np.zeros(0, np.float32), quality=Quality())
+    assert matcher.candidate_paths(rec, store=None, index=idx, th=th) == set()   # no crash, no candidates

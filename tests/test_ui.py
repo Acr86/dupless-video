@@ -233,6 +233,36 @@ def test_build_model_preserves_selection(store, monkeypatch):
     assert {p for p, _ in checked_files(m)} == {"/d1"}     # preserved; /d2 remains unchecked
 
 
+def test_remove_paths_drops_rows_and_singleton_clusters(store, monkeypatch):
+    """Optimistic in-app delete (Capa 3): remove_paths drops the deleted file rows from the tree IN
+    PLACE and removes any cluster left with <2 files (a singleton is no longer a duplicate group) —
+    an instant view update with no DB reload that could race a concurrent scan."""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+
+    from dupdetect.ui.model import PATH_ROLE, build_model, remove_paths
+    # Cluster 0: keep + 2 copies (deleting 1 copy keeps it a duplicate group).
+    # Cluster 1: keep + 1 copy  (deleting that copy collapses the whole cluster).
+    for p, keep, cid in [("/a_k", True, 0), ("/a_d1", False, 0), ("/a_d2", False, 0),
+                         ("/b_k", True, 1), ("/b_d1", False, 1)]:
+        store.save(_rec(p), feature_version="fv")
+        store.save_cluster(cid, p, is_keep=keep)
+    store.save_match("/a_k", "/a_d1", "CERTAIN", 0.99, "T1")
+    store.save_match("/b_k", "/b_d1", "CERTAIN", 0.99, "T1")
+    QApplication.instance() or QApplication([])
+    m = build_model(sort_clusters(load_clusters(store), "copies"))
+    assert m.invisibleRootItem().rowCount() == 2
+
+    removed = remove_paths(m, {"/a_d1", "/b_d1"})
+    assert removed == 1                                    # cluster 1 collapsed; cluster 0 survived
+    root = m.invisibleRootItem()
+    assert root.rowCount() == 1                            # only the multi-copy cluster remains
+    head = root.child(0)
+    paths = {head.child(j).data(PATH_ROLE) for j in range(head.rowCount())}
+    assert "/a_d1" not in paths and {"/a_k", "/a_d2"} <= paths   # deleted row gone, the rest intact
+
+
 def test_switch_db_reloads_tree(tmp_path, monkeypatch):
     """Selecting a different DB in the panel reloads the tree immediately (no scan needed)."""
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
@@ -546,3 +576,64 @@ def test_tray_watch_action_reflects_real_state(tmp_path, monkeypatch):
     assert "Start" in w._act_watch.text()            # stopped -> the menu offers Start
     w._really_quit = True
     w.close()
+
+
+# --------------------------------------------------------------- scan cancel vs failure (ScanPanel)
+
+def test_scan_cancel_not_reported_as_failure(tmp_path, monkeypatch):
+    """Canceling kills the subprocess (nonzero exit). _done must treat it as 'Canceled', not a
+    failure — EVEN IF a late heartbeat/buffered line overwrote the status text after _stop set it.
+    The decision uses an explicit state flag, not the label text (the old bug)."""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+
+    from dupdetect.ui.scan_panel import ScanPanel
+    QApplication.instance() or QApplication([])
+    panel = ScanPanel(str(tmp_path / "x.sqlite"))
+    panel._canceled = True                                       # user pressed Cancel
+    panel.status.setText("Pass 1 (analysis) · 137/479 · 22s/film")   # text clobbered by a late tick
+    shown = []
+    monkeypatch.setattr(panel, "_show_log", lambda *a, **k: shown.append(a))
+    panel._done(1, None)                                         # killed subprocess -> nonzero exit
+    assert shown == []                                           # NO failure dialog
+    assert "Canceled" in panel.status.text()
+
+
+def test_scan_real_failure_still_reported(tmp_path, monkeypatch):
+    """A genuine crash (not canceled) still surfaces the failure dialog + status — the flag fix must
+    not swallow real failures."""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+
+    from dupdetect.ui.scan_panel import ScanPanel
+    QApplication.instance() or QApplication([])
+    panel = ScanPanel(str(tmp_path / "x.sqlite"))
+    panel._canceled = False
+    panel._log = ["RuntimeError: boom"]
+    shown = []
+    monkeypatch.setattr(panel, "_show_log", lambda *a, **k: shown.append(a))
+    panel._done(1, None)
+    assert shown and "Failed" in panel.status.text()
+
+
+# --------------------------------------------------------------- duration formatting (elapsed/ETA/uptime)
+
+def test_fmt_duration_hms_and_days():
+    from dupdetect.util import fmt_duration
+    assert fmt_duration(0) == "0:00:00"
+    assert fmt_duration(90) == "0:01:30"
+    assert fmt_duration(90 * 60) == "1:30:00"           # 90 min must read 1:30:00, not 90:00
+    assert fmt_duration(3661) == "1:01:01"
+    assert fmt_duration(25 * 3600) == "1d 01:00:00"     # past 24h -> days
+    assert fmt_duration(-5) == "0:00:00"                # clamped
+
+
+def test_clock_to_secs_reformats_tqdm_eta():
+    from dupdetect.util import clock_to_secs, fmt_duration
+    assert clock_to_secs("00:30") == 30
+    assert clock_to_secs("1:01:01") == 3661
+    assert clock_to_secs("51:41:54") == 51 * 3600 + 41 * 60 + 54   # tqdm's flat hours
+    assert fmt_duration(clock_to_secs("51:41:54")) == "2d 03:41:54"  # rolled to days
+    assert clock_to_secs("?") == 0                      # unparseable -> 0

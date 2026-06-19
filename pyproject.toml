@@ -1,6 +1,6 @@
 [project]
 name = "dup-detector"
-version = "0.1.0"
+version = "0.1.1"
 description = "Content-based duplicate/upgrade detector for video libraries — a zero-false-positive staged decision tree over independent signals"
 requires-python = ">=3.11"
 license = { text = "MIT" }

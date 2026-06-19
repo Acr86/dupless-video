@@ -390,3 +390,55 @@ def test_full_scan_no_match_skips_pass2(th, store, tmp_path, monkeypatch):
         def feature_version(self): return FV
     rep = fs.full_scan(str(empty), store, _DummyEmbedder(), th, match=False)
     assert rep["clusters"] == [] and rep["review_queue"] == [] and rep["editions"] == []
+
+
+# --------------------------------------------------------------- concurrent-deletion guard (§0)
+
+def test_pass2_does_not_resurrect_deleted_candidate(tmp_path, th, store, monkeypatch):
+    """§0 concurrent-deletion guard: a candidate trashed MID-SCAN (gone from disk) must NOT be
+    re-persisted to `matches`, so the scan can't resurrect the row the UI just forgot (forget_file).
+    The coarse index is an in-memory snapshot, so without the guard a deleted file's vector still
+    yields a candidate pair and the deletion would silently bounce back into the list."""
+    from dupdetect.models import Verdict
+    from dupdetect.pipeline import fullscan
+    src = tmp_path / "src.mp4"; src.write_bytes(b"x")            # on disk
+    gone = str(tmp_path / "gone.mp4")                            # candidate NOT on disk
+    store.save(_rec(str(src)), feature_version=FV)
+
+    class _Res:                                                 # a fake match() hit at the gone file
+        candidate_path = gone
+        verdict = Verdict.CERTAIN
+        confidence = 1.0
+        reason = "x"
+        audio = video = scenes = None
+    monkeypatch.setattr(fullscan, "match", lambda *a, **k: [_Res()])
+    saved: list = []
+    monkeypatch.setattr(store, "save_match", lambda *a, **k: saved.append(a))
+    fullscan._pass2_sequential([str(src)], store, object(), th, cache=None, progress=False)
+    assert saved == []                                          # nothing persisted for the gone file
+
+
+# --------------------------------------------------------------- removal reuse (only re-rank changed)
+
+def test_rebuild_clusters_reuse_skips_unchanged(store, th, monkeypatch):
+    """On a removal, `_rebuild_clusters(reuse=...)` re-ranks ONLY the cluster whose membership changed;
+    untouched clusters keep their persisted KEEP/rank_reason — no whisper/audio on the whole library."""
+    from dupdetect.pipeline import fullscan
+    for p in ("/A", "/B", "/C", "/X", "/Y"):
+        store.save(_rec(p), feature_version=FV)
+    for a, b in [("/A", "/B"), ("/B", "/C"), ("/A", "/C")]:        # cluster {A,B,C}
+        store.save_match(a, b, "CERTAIN", 0.99, "T1")
+    store.save_match("/X", "/Y", "CERTAIN", 0.99, "T1")           # cluster {X,Y}
+    fullscan._rebuild_clusters(store, th)                          # initial build (ranks both)
+
+    prior = fullscan._snapshot_clusters(store)                    # snapshot BEFORE the removal
+    store.forget_file("/C")                                       # C leaves {A,B,C} -> {A,B}
+
+    calls = {"n": 0}
+    real = fullscan.rank_cluster
+    monkeypatch.setattr(fullscan, "rank_cluster",
+                        lambda m, s, t: (calls.__setitem__("n", calls["n"] + 1) or real(m, s, t)))
+    fullscan._rebuild_clusters(store, th, reuse=prior)
+    assert calls["n"] == 1                                        # only the changed {A,B} re-ranked
+    keeps = {r["path"] for r in store.conn.execute("SELECT path FROM clusters WHERE is_keep=1")}
+    assert "/X" in keeps                                          # untouched cluster kept its KEEP

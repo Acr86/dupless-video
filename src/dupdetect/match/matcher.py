@@ -33,6 +33,12 @@ def candidate_paths(rec: Record, store: FingerprintStore, index: CoarseIndex,
       2. multi-vector by temporal window (rescues cam rips / globals with ads)
       3. duration blocking ±tol (always compares similar runtimes)
     """
+    # A record with NO global embedding (e.g. a file Pass-1 could not decode any frames from -> empty
+    # vec) can't be video-matched, and querying faiss with a dim-0 vector trips `assert d == self.d`
+    # and crashes the WHOLE Pass-2 batch. Skip it (§2: skip-and-report, never crash the batch) -> no
+    # candidates, so it simply produces no matches.
+    if rec.global_vec is None or not getattr(rec.global_vec, "size", 0):
+        return set()
     cands = {p for p, _ in index.query_global(rec.global_vec, k=th.faiss_k)}
     if th.n_window_vecs > 0 and rec.window_vecs.size:
         cands |= index.query_windows(rec.window_vecs, k=th.raw["retrieval"]["window_faiss_k"])
