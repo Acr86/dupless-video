@@ -442,3 +442,54 @@ def test_rebuild_clusters_reuse_skips_unchanged(store, th, monkeypatch):
     assert calls["n"] == 1                                        # only the changed {A,B} re-ranked
     keeps = {r["path"] for r in store.conn.execute("SELECT path FROM clusters WHERE is_keep=1")}
     assert "/X" in keeps                                          # untouched cluster kept its KEEP
+
+
+# --------------------------------------------------------------- cluster fusion regression (§0)
+
+def test_rebuild_clusters_no_cross_component_fusion(store, th):
+    """REGRESSION: distinct match-components must NEVER share a cluster_id (the bug fused 88/169
+    clusters under colliding enumerate() indices during concurrent rebuilds). Two DISCONNECTED
+    duplicate pairs must yield two clusters, each = exactly one component."""
+    from dupdetect.pipeline import fullscan
+    for p in ("/a", "/b", "/c", "/d"):
+        store.save(_rec(p), feature_version=FV)
+    store.save_match("/a", "/b", "CERTAIN", 0.99, "T1")        # component 1
+    store.save_match("/c", "/d", "CERTAIN", 0.99, "T1")        # component 2 (no edge to comp 1)
+    fullscan._rebuild_clusters(store, th)
+    by_cid = {}
+    for r in store.conn.execute("SELECT cluster_id, path FROM clusters"):
+        by_cid.setdefault(r["cluster_id"], set()).add(r["path"])
+    assert len(by_cid) == 2                                    # two clusters, NOT one fused
+    assert sorted(sorted(s) for s in by_cid.values()) == [["/a", "/b"], ["/c", "/d"]]
+
+
+def test_stable_cluster_id_distinct_and_order_independent():
+    """Content-derived ids: same component -> same id (order-independent via min); distinct components
+    -> distinct ids. This is what stops concurrent rebuilds from reusing index 0,1,2.. for unrelated
+    components and fusing them."""
+    from dupdetect.pipeline.fullscan import _stable_cluster_id
+    assert _stable_cluster_id(["/a", "/b"]) == _stable_cluster_id(["/b", "/a"])
+    assert _stable_cluster_id(["/a", "/b"]) != _stable_cluster_id(["/c", "/d"])
+
+
+def test_rebuild_clusters_ids_stable_across_runs(store, th):
+    """The same component keeps the SAME cluster_id across independent rebuilds (so two concurrent
+    rebuilds agree, and the UI/KEEP survives a refresh)."""
+    from dupdetect.pipeline import fullscan
+    for p in ("/a", "/b"):
+        store.save(_rec(p), feature_version=FV)
+    store.save_match("/a", "/b", "CERTAIN", 0.99, "T1")
+    fullscan._rebuild_clusters(store, th)
+    cid1 = store.conn.execute("SELECT DISTINCT cluster_id FROM clusters").fetchone()["cluster_id"]
+    fullscan._rebuild_clusters(store, th)                      # rebuild again from scratch
+    cid2 = store.conn.execute("SELECT DISTINCT cluster_id FROM clusters").fetchone()["cluster_id"]
+    assert cid1 == cid2
+
+
+def test_replace_clusters_is_full_atomic_replace(store):
+    """replace_clusters wipes + rewrites in ONE transaction (last rebuild wins entirely) — no leftover
+    rows from a previous rebuild can linger to fuse a cluster."""
+    store.replace_clusters([(10, "/a", True, ""), (10, "/b", False, "")])
+    store.replace_clusters([(20, "/c", True, ""), (20, "/d", False, "")])
+    rows = {(r["cluster_id"], r["path"]) for r in store.conn.execute("SELECT cluster_id, path FROM clusters")}
+    assert rows == {(20, "/c"), (20, "/d")}                    # first replace fully gone

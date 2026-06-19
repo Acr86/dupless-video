@@ -476,6 +476,19 @@ class FingerprintStore:
             (MIN_CLUSTER_MEMBERS,))
         self.conn.commit()
 
+    def replace_clusters(self, rows) -> None:
+        """ATOMICALLY replace the ENTIRE clusters table in ONE transaction: a rebuild is
+        all-or-nothing, so a CONCURRENT rebuild (e.g. the watcher while a scan runs) can't interleave
+        its per-row writes with ours and FUSE distinct match-components under a shared cluster_id.
+        `rows`: iterable of (cluster_id, path, is_keep, rank_reason). Combined with content-derived
+        (stable) cluster ids, two independent rebuilds agree on ids and unrelated components never
+        collide. Replaces the old clear_clusters()+per-row save_cluster() (each its own commit)."""
+        rows = [(int(cid), str(p), 1 if keep else 0, reason or "") for cid, p, keep, reason in rows]
+        with self.conn:                                    # single BEGIN..COMMIT (rolls back on error)
+            self.conn.execute("DELETE FROM clusters")
+            self.conn.executemany(
+                "INSERT INTO clusters (cluster_id, path, is_keep, rank_reason) VALUES (?,?,?,?)", rows)
+
     def save_cluster(self, cluster_id: int, path: str, is_keep: bool,
                      rank_reason: str = "") -> None:
         """A5: persists the cluster/keep decision — source of truth for actions."""

@@ -11,6 +11,31 @@ Newest on top. Append-only in spirit. Deep rationale for the design invariants l
 
 ## Entries
 
+### Unrelated movies fused into one CERTAIN cluster (clusters table ≠ match graph)
+- **Symptom:** a cluster shows totally different content as "N copies · CERTAIN" (e.g. a 2-second 1440p
+  clip pair AND a 66-minute SD movie pair under one header, two ★ KEEPs). The MATCHES are correct — it's
+  not a false-positive embedding/audio match.
+- **Root cause:** `cluster_id` was a per-rebuild `enumerate()` index, and cluster rebuilds are NOT
+  mutually exclusive across processes, NOR atomic: `_rebuild_clusters` did `clear_clusters()` (commit)
+  then per-row `save_cluster()` (each its own commit). When two rebuilds run concurrently (the watcher's
+  `reconcile_removals`/`ingest_new` while a scan runs, or a one-off sweep while the live watcher is up),
+  both number their components 0,1,2,…; their committed writes interleave and components that land on the
+  SAME index number coexist under one `cluster_id` (PK is (cluster_id, path), so different paths under one
+  id just merge). Measured on the real DB: match graph had 238 correct components but the table had 169
+  clusters, 88 of them internally disconnected — and the fused ids formed a contiguous LOW band (7–94)
+  with HIGH ids (95–169) clean: the exact fingerprint of two `enumerate()`s overlapping in their low
+  range. This is a §0 break (KEEP/reclaim span unrelated content → user could delete a unique file).
+  NOTE: the split-priority change (watcher reconcile runs during a scan) widened the concurrency window.
+- **Resolution:** (1) ATOMIC rebuild — `store.replace_clusters(rows)` does DELETE+INSERT in ONE
+  transaction, so a concurrent rebuild can't interleave (last rebuild wins entirely). (2) STABLE,
+  content-derived ids — `_stable_cluster_id(members)` = blake2b of the component's min member (56-bit),
+  so independent rebuilds AGREE on a component's id and DISTINCT components never collide. Applied to
+  both `_rebuild_clusters` and exact_scan's `_build_exact_clusters`. (3) One-time repair: a clean rebuild
+  from `matches` split the 88 fused back into the 238 correct clusters.
+- **Files / refs:** `store.py` `replace_clusters`; `pipeline/fullscan.py` `_stable_cluster_id`,
+  `_rebuild_clusters`, `_build_exact_clusters`; tests in `test_fullscan.py`.
+- **Scope:** decided 2026-06-19.
+
 ### Watcher "Fast-Lane": a just-dropped file waits behind the whole backlog
 - **Symptom:** with a large backlog (~8,760 files still needing full analysis), a newly added/changed
   file isn't indexed promptly — the watcher processes pending files in arbitrary `rglob` order and the

@@ -12,6 +12,7 @@ Verde: surfaces DIFFERENT_EDITION as "related, not duplicates".
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -437,26 +438,37 @@ def _snapshot_clusters(store: FingerprintStore) -> dict:
     return {frozenset(e["paths"]): (e["keep"], e["reasons"]) for e in by_cid.values()}
 
 
+def _stable_cluster_id(members: list[str]) -> int:
+    """A content-derived, STABLE cluster id (56-bit) from the component's lexicographically smallest
+    member. Two INDEPENDENT rebuilds therefore agree on the id for a given component, and DISTINCT
+    components never collide — so concurrent rebuilds can't fuse unrelated content under a shared
+    `enumerate()` index (the bug that merged 88/169 clusters). Stable across rebuilds = the UI/KEEP
+    selection survives a refresh too."""
+    key = min(members).encode("utf-8", "surrogatepass")
+    return int.from_bytes(hashlib.blake2b(key, digest_size=7).digest(), "big")
+
+
 def _rebuild_clusters(store: FingerprintStore, th: Thresholds, reuse: Optional[dict] = None) -> list[dict]:
-    """A5: clusters = derived view of the GLOBAL `matches` graph (not the yields of
-    this run). Rebuilds the full table -> a re-scan leaves no stale clusters
-    dangling (a path in two clusters). Union-find over all duplicate pairs.
+    """A5: clusters = derived view of the GLOBAL `matches` graph (not the yields of this run).
+    Rebuilds the full table ATOMICALLY (one transaction via store.replace_clusters) with STABLE,
+    content-derived cluster ids -> a concurrent rebuild can neither interleave rows nor reuse an id
+    for a different component, so distinct match-components are never fused. Union-find over all
+    duplicate pairs; a removed hub correctly SPLITS its cluster.
 
     `reuse` (a `_snapshot_clusters` map taken BEFORE a removal): a rebuilt group whose membership is
     unchanged keeps its persisted KEEP/rank_reason instead of re-running rank_cluster — so deleting a
-    file only re-ranks the clusters it actually touched, not the whole library. NOT passed by
-    full_scan / ingest, where a member's data may have changed (re-encode) and ranking must be fresh.
-    The union-find still runs in full (cheap), so a removed hub correctly SPLITS its cluster."""
+    file only re-ranks the clusters it actually touched. NOT passed by full_scan / ingest, where a
+    member's data may have changed (re-encode) and ranking must be fresh."""
     reuse = reuse or {}
     uf = UnionFind()
     for a, b, verdict in store.all_matches():
         if verdict in _DUPLICATE_VALUES:
             uf.union(a, b)
-    store.clear_clusters()
-    clusters_out = []
-    for cid, members in enumerate(uf.groups().values()):
+    rows, clusters_out = [], []
+    for members in uf.groups().values():
         if len(members) <= 1:
             continue
+        cid = _stable_cluster_id(members)
         cached = reuse.get(frozenset(members))
         if cached is not None:                     # membership unchanged -> reuse ranking (no whisper/audio)
             keep, reasons = cached
@@ -465,9 +477,9 @@ def _rebuild_clusters(store: FingerprintStore, th: Thresholds, reuse: Optional[d
         else:
             ranked = rank_cluster(members, store, th)
         for m in members:
-            store.save_cluster(cid, m, is_keep=(m == ranked["keep"]),
-                               rank_reason=ranked["evidence"].get(m, ""))
+            rows.append((cid, m, m == ranked["keep"], ranked["evidence"].get(m, "")))
         clusters_out.append({"cluster_id": cid, **ranked})
+    store.replace_clusters(rows)                   # atomic: all-or-nothing, no interleave with a rebuild
     return clusters_out
 
 
@@ -542,19 +554,19 @@ def _build_exact_clusters(by_hash, store, th) -> list[dict]:
     construction. Star topology (a representative linked to every other copy) is O(N); skip a pair
     that already carries a content verdict so a prior full-scan T1 is not clobbered (mirrors the
     has_match rule)."""
-    store.clear_clusters()
-    groups = [(k, v) for k, v in by_hash.items() if len(v) > 1]
-    clusters_out = []
-    for cid, (_, members) in enumerate(groups):
+    groups = [v for _, v in by_hash.items() if len(v) > 1]
+    rows, clusters_out = [], []
+    for members in groups:
+        cid = _stable_cluster_id(members)                # stable, content-derived: no cross-rebuild fusion
         ranked = rank_cluster(members, store, th)        # identical copies: arbitrary keep, ok
         for m in members:
-            store.save_cluster(cid, m, is_keep=(m == ranked["keep"]),
-                               rank_reason=ranked["evidence"].get(m, ""))
+            rows.append((cid, m, m == ranked["keep"], ranked["evidence"].get(m, "")))
         hub = ranked["keep"] or members[0]
         for m in members:
             if m != hub and not store.has_match(hub, m):
                 store.save_match(hub, m, Verdict.CERTAIN.value, 1.00, T0_REASON)
         clusters_out.append({"cluster_id": cid, **ranked})
+    store.replace_clusters(rows)                         # atomic full replace (no interleave with a rebuild)
     return clusters_out
 
 
