@@ -15,7 +15,7 @@ SIZE_ROLE = Qt.UserRole + 2
 KEEP_ROLE = Qt.UserRole + 3
 KIND_ROLE = Qt.UserRole + 4                         # 'cluster' | 'file' | 'problem' | 'detail'
 
-HEADERS = ["Movie / file", "Res", "Size", "Codec", "Language", "Path"]
+HEADERS = ["Movie / file", "Resolution", "Size", "Codec", "Language", "Path"]
 PROBLEM_HEADERS = ["File / reason", "Size", "Folder"]
 
 
