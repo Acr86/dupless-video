@@ -35,6 +35,7 @@ from dupdetect.pipeline.fullscan import (
 )
 from dupdetect.runtime import scan_in_progress
 from dupdetect.store import FingerprintStore
+from dupdetect.store.store import canonical_path
 
 # Default: a file must be unmodified for this long before we touch it (avoid mid-copy reads).
 DEFAULT_STABLE_S = 15.0
@@ -370,17 +371,20 @@ def watch_once(ctx: WatchContext, tuning: Optional[WatchTuning] = None, *,
 
 def _route_event(event, deleted, changed) -> None:
     """Push a watchdog event's exact path onto the right fast-lane deque (consumer dedups + validates).
-    A dir event is skipped (a recursive delete may report only the dir -> the backstop sweep covers it)."""
+    A dir event is skipped (a recursive delete may report only the dir -> the backstop sweep covers it).
+    Paths are CANONICALIZED: watchdog builds src_path as (watched root, as given with '/') + (relative
+    with '\\') -> a '/'+'\\' MIX that, stored as-is, becomes a PHANTOM DUPLICATE of the scan's pathlib
+    form. canonical_path folds it to the same key collect_videos produces, so one file = one record."""
     if event.is_directory:
         return
     et = event.event_type
     if deleted is not None and et in ("deleted", "moved"):
-        deleted.append(event.src_path)                        # left this path -> forget it
+        deleted.append(canonical_path(event.src_path))        # left this path -> forget it
     if changed is not None:
         if et in ("created", "modified"):
-            changed.append(event.src_path)                    # new/changed -> fast-lane index
+            changed.append(canonical_path(event.src_path))    # new/changed -> fast-lane index
         elif et == "moved":
-            changed.append(getattr(event, "dest_path", "") or event.src_path)   # moved-into
+            changed.append(canonical_path(getattr(event, "dest_path", "") or event.src_path))  # moved-into
 
 
 def start_fs_events(targets, wake, deleted=None, changed=None) -> Optional[Callable[[], None]]:

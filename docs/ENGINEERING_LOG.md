@@ -11,6 +11,25 @@ Newest on top. Append-only in spirit. Deep rationale for the design invariants l
 
 ## Entries
 
+### Phantom duplicate records: same file under '/' and '\' paths (Windows)
+- **Symptom:** the DB shows the SAME file twice (inflated index, even a file "duplicate" of itself).
+  Diagnosis: some `files.path` were like `L:/Media/Adult\Flat\x.mp4` (root with '/', rest with '\')
+  while others were all-'\' — two rows for one file (measured: 78 mixed-form rows, 76 distinct files).
+- **Root cause:** the mixed form is `os.path.join(root, rel)` where the root was passed with forward
+  slashes — i.e. WATCHDOG's `event.src_path` (watched dir as given, '/', + relative, '\'). The scan
+  stores pathlib-normalized paths (all '\'), so the watcher's event paths key DIFFERENTLY → a second
+  record. Windows treats '/' and '\' as the same separator on disk, but the SQLite `path` string is a
+  plain key, so the two forms are distinct rows.
+- **Resolution:** `canonical_path(p) = str(Path(p))` (OS-native form) applied at the PRODUCER that was
+  non-canonical — `watch._route_event` (the watchdog deque feed). `collect_videos` already yields
+  pathlib-canonical paths, so both producers now agree → one file, one record. Deliberately NOT applied
+  inside the store: that would rewrite synthetic '/'-paths used across the test-suite to '\' on Windows
+  (e.g. `cl.keep.path == "/Ik4k"` would break), and the store is fed only by these two producers.
+  One-time repair: `forget_file` each '/'-form row (removes its row+matches+clusters+npy; the '\'-twin
+  remains; unique ones get re-added canonically by the next scan), then rebuild clusters.
+- **Files / refs:** `store.py` `canonical_path`; `watch.py` `_route_event`; tests in `test_ui.py`.
+- **Scope:** decided 2026-06-19.
+
 ### Unrelated movies fused into one CERTAIN cluster (clusters table ≠ match graph)
 - **Symptom:** a cluster shows totally different content as "N copies · CERTAIN" (e.g. a 2-second 1440p
   clip pair AND a 66-minute SD movie pair under one header, two ★ KEEPs). The MATCHES are correct — it's

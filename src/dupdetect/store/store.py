@@ -578,6 +578,16 @@ def _safe_key(path: str) -> str:
     return hashlib.sha1(path.encode("utf-8")).hexdigest()[:16]
 
 
+def canonical_path(p: str) -> str:
+    """Canonical key for a file path: the OS-native form via pathlib, so the SAME file maps to ONE
+    record no matter how the path was built. On Windows this folds a '/'+'\\' MIX (e.g. a watchdog
+    event path 'L:/Media\\sub\\x.mp4' vs a scan's pathlib 'L:\\Media\\sub\\x.mp4') to a single string;
+    without it the two are stored as DIFFERENT files -> phantom duplicates of the same video.
+    Applied at the PRODUCERS (watchdog events; collect_videos is already pathlib-canonical) rather than
+    in the store, so synthetic '/'-paths in tests are stored verbatim and stay portable."""
+    return str(Path(p))
+
+
 def canonical_pair(a: str, b: str) -> tuple[str, str]:
     """C2: stable ordering of a pair so it is evaluated and stored ONCE."""
     return (a, b) if a <= b else (b, a)

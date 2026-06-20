@@ -637,3 +637,37 @@ def test_clock_to_secs_reformats_tqdm_eta():
     assert clock_to_secs("51:41:54") == 51 * 3600 + 41 * 60 + 54   # tqdm's flat hours
     assert fmt_duration(clock_to_secs("51:41:54")) == "2d 03:41:54"  # rolled to days
     assert clock_to_secs("?") == 0                      # unparseable -> 0
+
+
+# --------------------------------------------------------------- path canonicalization (no '/' vs '\' dupes)
+
+
+def test_canonical_path_idempotent_and_collapses():
+    """OS-agnostic: redundant dot / double-slash collapse, and idempotent."""
+    from dupdetect.store.store import canonical_path
+    assert canonical_path("a/./b//c") == canonical_path("a/b/c")
+    once = canonical_path("a/b/c")
+    assert canonical_path(once) == once
+
+
+@pytest.mark.skipif(os.name != "nt", reason="separator folding is Windows-specific")
+def test_route_event_canonicalizes_watchdog_paths():
+    """Source fix: a watchdog event path mixing '/' (root) and the OS sep (relative) is
+    canonicalized to the same key collect_videos produces -> one file, one record (no phantom dupe).
+    """
+    from collections import deque
+
+    from dupdetect.store.store import canonical_path
+    from dupdetect.watch import _route_event
+    bs = chr(92)
+    mixed = "Z:/Media/Adult" + bs + "Flat" + bs + "movie.mp4"
+    canon = "Z:" + bs + "Media" + bs + "Adult" + bs + "Flat" + bs + "movie.mp4"
+
+    class _Ev:
+        is_directory = False
+        event_type = "created"
+        src_path = mixed
+    changed = deque()
+    _route_event(_Ev(), None, changed)
+    assert list(changed) == [canonical_path(canon)]
+    assert "/" not in changed[0]
