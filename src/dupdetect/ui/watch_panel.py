@@ -38,7 +38,7 @@ class WatchPanel(QGroupBox):
     cycle = Signal(int, int, int)                           # (indexed, removed, new_dups) per cycle
 
     def __init__(self, db_path: str, parent=None):
-        super().__init__("Keep updated — background watch", parent)
+        super().__init__("Keep updated", parent)
         self.proc: QProcess | None = None
         self._db = db_path
         self._log: list[str] = []                           # captured output (shown if it crashes)
