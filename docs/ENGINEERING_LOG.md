@@ -11,6 +11,44 @@ Newest on top. Append-only in spirit. Deep rationale for the design invariants l
 
 ## Entries
 
+### Files deleted outside the app linger in the duplicates list forever ("I deleted folders, still see them")
+- **Symptom:** the UI keeps showing files/clusters for videos the user deleted in Explorer. Opening or
+  refreshing the app does NOT clear them.
+- **Root cause:** the UI is a pure VIEW — `ui.data.load_clusters` reads `clusters ⋈ files` with NO
+  existence check, and nothing prunes the `files`/`clusters` tables on open. Reconciliation lived ONLY
+  in (a) the in-app delete (`actions.delete_files` → `forget_file`) and (b) the background watcher.
+  The watcher's `orphan_paths` (watch.py) guards by WATCHED-ROOT reachability: delete the whole watched
+  root and `os.path.exists(root)` is False → the root is dropped (its §2 offline-drive guard) → its
+  files are never forgotten (**Mode B**). With no watcher running (**Mode A**) nothing prunes at all.
+- **Resolution:** new `FingerprintStore.prune_missing_files()` (store.py) — a §2 self-heal the UI runs
+  on open / switch_db / ↻ / a "🧹 Clean missing" button (NOT per-keystroke; SKIPPED while a scan holds
+  the priority lock so it can't race Pass-2's `_both_on_disk` resurrection guard §0 or fight the HDD
+  §1). The CALLER rebuilds clusters with `reuse=_snapshot_clusters()` (only touched clusters re-rank).
+  **Guard design was shaped by an adversarial review that REPRODUCED mass-forget holes in the naive
+  "volume-anchor only" version** — forgetting records is recoverable (re-scan rebuilds; the file on disk
+  is never touched), but wiping the index on an unmount is expensive, so it must be fail-safe:
+    1. VOLUME fast-skip — one `exists(anchor)` probe per drive; an unmounted drive, or a degenerate /
+       unknown anchor (bare-backslash "UNC" `\\`, drive-relative `C:foo`) → skip ALL its files. The
+       degenerate forms were found to otherwise resolve to the current drive root (reachable) and
+       mass-forget legacy rows.
+    2. MOUNT-AWARE per-file (`_real_deletion`) — a gone file counts as a real deletion only if NO
+       disconnected mount/junction sits between it and the nearest present dir. An offline nested NAS
+       **junction** under a mounted drive (`exists('L:\\')` True, the subtree unreachable) is KEPT
+       (`Path(x).is_junction()` reads the reparse entry even when the target is offline); a plainly
+       deleted SUBFOLDER on an online volume is CLEANED (Mode B). The simple parent-dir guard
+       (`prune_missing_problems` style) does NOT work here — it would skip Mode B (the deleted folder
+       is the parent). POSIX caveat: anchor is always `/`, so nested-mount protection there leans on
+       `os.path.ismount`; documented as Windows-precise.
+  `exists`/`isdir`/`ismount` injectable → the decision core is deterministic and unit-tested without
+  real drives/junctions (offline-drive kept, offline-junction kept, Mode B forgotten, degenerate
+  anchors kept). Verified end-to-end: open a real DB with one present + one missing file → the missing
+  one is forgotten, the present one kept, the orphaned cluster collapses.
+- **Files / refs:** `store.py` `prune_missing_files` + `_volume_root`/`_volume_reachable`/`_is_mount`/
+  `_real_deletion`; `ui/main.py` `_refresh_with_prune` + "Clean missing" button; tests in
+  `test_perf_opts.py`, `test_ui.py`. FOLLOW-UP: the watcher `_full_sweep` can adopt the same guard to
+  close Mode B in the background (needs normcase alignment with `orphan_paths` + its own test).
+- **Scope:** decided 2026-06-21.
+
 ### Pass-2 (candidate matching) ETA ~8h / "is the parallel pass even using the cores?"
 - **Symptom:** a full scan sat in Pass-2 at ~59 pair/s, ETA ~8h for 1.9M candidate pairs (~19k files,
   library on a spinning HDD). The in-code comment claimed Pass-2 was "COMPUTE-bound (banded DP ~89%),
