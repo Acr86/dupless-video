@@ -8,6 +8,8 @@ C3: the align offset (pre-roll ads) is propagated here, it is a pair-level prope
 """
 from __future__ import annotations
 
+import contextlib
+import os
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict
 
@@ -157,11 +159,42 @@ def match(rec: Record, store: FingerprintStore, index: CoarseIndex,
 
 
 # --------------------------------------------------------------------------- Pass-2 parallel
-# Pass-2 is COMPUTE-bound (banded video DP ~89%), not I/O-bound, so it scales across cores
-# without disk thrashing (unlike Pass-1). Workers are READ-ONLY store handles (init_schema=False),
-# so concurrent openers don't contend. Results are deterministic per pair -> verdict invariant (§0).
+# Pass-2 is CPU-COMPUTE-bound (per-pair similarity matmul + banded video DP), not I/O-bound: the
+# embeddings are small fp16 .npy the OS page cache holds, so they don't thrash the disk. Parallelism
+# is across PROCESSES (workers are READ-ONLY store handles, init_schema=False, so concurrent openers
+# don't contend). Results are deterministic per pair -> verdict invariant (§0).
+#
+# THREAD PINNING (perf, §1): each worker's numpy matmul calls OpenBLAS, which by default spawns ~one
+# thread per core. With W worker processes on a C-core box that is ~W*C threads fighting over C cores
+# -> catastrophic oversubscription (measured the dominant Pass-2 throttle: 30 procs x ~32 BLAS threads
+# on 32 cores). Parallelism must come from the PROCESSES, so each worker's BLAS is pinned to 1 thread
+# (see single_threaded_blas, applied around the pool). Speed only -> verdict unchanged (§0).
 
 _PW: dict = {}                                          # per-worker state (spawn-safe)
+
+# Env vars every common BLAS/OpenMP backend honors for its internal thread count.
+_BLAS_THREAD_VARS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                     "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS")
+
+
+@contextlib.contextmanager
+def single_threaded_blas():
+    """Pin BLAS/OpenMP to 1 thread for the duration, then restore the prior values. Wraps the Pass-2
+    process pool so its W workers don't each launch a multi-threaded matmul (W*cores threads thrashing
+    `cores` CPUs). Set in the PARENT *before* the pool so spawned workers inherit it at interpreter
+    start (Windows spawn reads OPENBLAS_NUM_THREADS at the child's numpy import). Restored on exit so
+    the parent's own later numpy/faiss work is unaffected. Verdict-invariant (§0: the matmul values are
+    unchanged; only BLAS's internal thread count differs)."""
+    prev = {k: os.environ.get(k) for k in _BLAS_THREAD_VARS}
+    os.environ.update(dict.fromkeys(_BLAS_THREAD_VARS, "1"))
+    try:
+        yield
+    finally:
+        for k, v in prev.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def _pass2_init(db_path: str, th: Thresholds) -> None:
@@ -267,8 +300,11 @@ def match_pairs_parallel(paths, store: FingerprintStore, index: CoarseIndex,
         if rec is not None:
             _ensure_audio_fp(rec, store, th)
     rows = []
-    with ProcessPoolExecutor(max_workers=workers, initializer=_pass2_init,
-                             initargs=(str(store.db_path), th)) as pool:
+    # single_threaded_blas: pin each worker's BLAS to 1 thread BEFORE the pool spawns, so W processes
+    # don't oversubscribe the cores with W*cores matmul threads (perf, §1; verdict unchanged, §0).
+    with single_threaded_blas(), ProcessPoolExecutor(
+            max_workers=workers, initializer=_pass2_init,
+            initargs=(str(store.db_path), th)) as pool:
         for row in tqdm(pool.map(_pass2_pair, pair_list, chunksize=4), total=len(pair_list),
                         desc="Pass 2 (align pairs)", unit="pair",
                         disable=not progress, dynamic_ncols=True):

@@ -3,6 +3,8 @@ store helpers, opt-in cap of audio_fp in feature_version, and storage auto-tune.
 All pure (no real disk or GPU): auto-tune receives injected latency."""
 from __future__ import annotations
 
+import os
+
 from dupdetect.store import FingerprintStore, classify_problem
 from dupdetect.tuning import autotune
 
@@ -106,6 +108,39 @@ def test_audio_fp_max_for_duration_gate():
     assert th.audio_fp_max_for(7200) == 600                       # 2h movie -> capped head
     assert th.audio_fp_max_for(None) == 600                       # unknown duration -> cap (conservative)
     assert th.audio_fp_max_for(0) == 600                          # zero/unknown -> cap
+
+
+# --------------------------------------------------------------- Pass-2 BLAS thread pinning (perf §1)
+def test_single_threaded_blas_pins_then_restores(monkeypatch):
+    """Inside the context the BLAS/OpenMP thread vars are '1' (so the Pass-2 process pool doesn't
+    oversubscribe the cores); on exit the PRIOR state is restored exactly: a var that was unset is
+    removed again, and a pre-existing value is put back. Speed-only -> verdict unchanged (§0)."""
+    from dupdetect.match.matcher import _BLAS_THREAD_VARS, single_threaded_blas
+
+    # One var pre-set by the user, the rest unset -> both restore paths are exercised.
+    preset = _BLAS_THREAD_VARS[0]
+    for v in _BLAS_THREAD_VARS:
+        monkeypatch.delenv(v, raising=False)
+    monkeypatch.setenv(preset, "8")
+
+    with single_threaded_blas():
+        assert all(os.environ[v] == "1" for v in _BLAS_THREAD_VARS)   # pinned for the pool's lifetime
+
+    assert os.environ.get(preset) == "8"                              # pre-existing value restored
+    assert all(v not in os.environ for v in _BLAS_THREAD_VARS[1:])    # previously-unset vars removed
+
+
+def test_single_threaded_blas_restores_on_exception():
+    """The restore runs even if the wrapped block raises (the pool can fail mid-scan, §2)."""
+    from dupdetect.match.matcher import _BLAS_THREAD_VARS, single_threaded_blas
+
+    before = {v: os.environ.get(v) for v in _BLAS_THREAD_VARS}
+    try:
+        with single_threaded_blas():
+            raise RuntimeError("pool boom")
+    except RuntimeError:
+        pass
+    assert {v: os.environ.get(v) for v in _BLAS_THREAD_VARS} == before
 
 
 # --------------------------------------------------------------- storage-aware auto-tune
