@@ -6,6 +6,7 @@ venv has). Verdicts are identical on CPU and GPU (measured: fp32 vs fp16 = 0 fli
 is only speed + installer size. See docs/BUILD_WINDOWS.md for picking the venv.
 
   pip install pyinstaller
+  python setup.py build_ext --inplace  # OPTIONAL Pass-2 Cython accelerator (align/_fastdp) -> bundled if built
   python scripts/vendor_model.py     # DINOv2 repo + checkpoint  -> bundle/models
   python scripts/vendor_bin.py       # ffmpeg/ffprobe/fpcalc     -> bundle/bin/win
   pyinstaller --noconfirm dupless-video.spec
@@ -30,6 +31,14 @@ hidden += collect_submodules("torch") + collect_submodules("torchvision")
 hidden += collect_submodules("watchdog")
 hidden += ["numpy", "yaml", "send2trash",
            "PySide6.QtNetwork", "PySide6.QtWidgets", "PySide6.QtGui", "PySide6.QtCore"]
+
+# Optional compiled Pass-2 accelerator (align/_fastdp): the code imports it in a try/except, so static
+# analysis may skip it. Add it as a hidden import ONLY when it was actually built (run
+# `python setup.py build_ext --inplace` first) -> the frozen app gets the fast path; without it, the
+# pure-Python fallback ships and the build never fails for a missing module.
+import glob as _glob
+if _glob.glob("src/dupdetect/align/_fastdp*.pyd") or _glob.glob("src/dupdetect/align/_fastdp*.so"):
+    hidden.append("dupdetect.align._fastdp")
 
 # The bundle is loaded from the FILESYSTEM at runtime (torch.hub source='local' reads the DINOv2 .py
 # from bundle/models/hub/...; resolve_binary execs bundle/bin/win/*.exe), so ship it as plain data.

@@ -54,8 +54,14 @@ frozen app uses its OWN known-good model + binaries regardless of the user's mac
 ## 2. Freeze with PyInstaller
 
 ```powershell
+python setup.py build_ext --inplace            # OPTIONAL Pass-2 Cython accelerator (align/_fastdp)
 pyinstaller --noconfirm dupless-video.spec     # -> dist\Dupless Video\  (the COLLECT folder)
 ```
+
+> `build_ext` compiles the Pass-2 hot-loop accelerator (`align/_fastdp.pyx` -> a `.pyd`) so the frozen
+> app runs the fast path; the spec bundles it **only if built** (conditional hidden import). Skipping it
+> is safe — the app falls back to the pure-Python implementation (slower Pass-2, identical verdicts).
+> Needs a C compiler (MSVC Build Tools, already required for the build venv).
 
 Smoke-test the frozen app before packaging:
 
