@@ -271,6 +271,11 @@ def test_switch_db_reloads_tree(tmp_path, monkeypatch):
 
     from dupdetect.ui.main import MainWindow
 
+    # This test uses SYNTHETIC top-level paths ('/c0_k', …) that don't exist on disk; the on-open
+    # existence sweep is covered by its own tests (test_perf_opts) — neutralize it here so it doesn't
+    # forget the fixtures (their POSIX anchor '/' reads as a reachable volume on Linux CI).
+    monkeypatch.setattr(FingerprintStore, "prune_missing_files", lambda self, **k: 0)
+
     def mkdb(name, n):
         st = FingerprintStore(tmp_path / name)
         for cid in range(n):

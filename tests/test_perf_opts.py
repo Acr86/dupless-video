@@ -75,6 +75,99 @@ def test_prune_missing_problems_forgets_deleted_not_offline(tmp_path):
     s.close()
 
 
+# --------------------------------------------------------------- file-existence self-heal (prune_missing_files)
+def _save_file(s, path):
+    """Insert a minimal indexed file row (LITE: metadata only, no .npy) for the existence-sweep tests."""
+    from dupdetect.models import Probe
+    s.save_meta(path, 0.0, 100, "h",
+                Probe(duration_s=1.0, width=0, height=0, vcodec="h264", bitrate_kbps=None), "fv")
+
+
+def test_prune_missing_files_forgets_deleted_on_reachable_volume(tmp_path):
+    """Mode A: a file gone from disk on a mounted volume (its folder still present) is forgotten."""
+    s = FingerprintStore(tmp_path / "p.sqlite")
+    p = str(tmp_path / "Media" / "gone.mkv")
+    _save_file(s, p)
+    n = s.prune_missing_files(exists=lambda x: x != p,            # all present except the file
+                              isdir=lambda x: True, ismount=lambda x: False)
+    assert n == 1 and p not in s.all_paths()
+    s.close()
+
+
+def test_prune_missing_files_mode_b_deleted_subfolder_volume_online(tmp_path):
+    """Mode B (the reported bug): a whole SUBFOLDER was deleted while the drive stays online. Its files
+    ARE cleaned even though their parent dir is gone — what orphan_paths' watched-root guard misses."""
+    s = FingerprintStore(tmp_path / "p.sqlite")
+    folder = str(tmp_path / "Media" / "OldShow")
+    p = os.path.join(folder, "ep.mkv")
+    _save_file(s, p)
+    n = s.prune_missing_files(
+        exists=lambda x: not x.startswith(folder),               # volume + Media online; OldShow gone
+        isdir=lambda x: not x.startswith(folder),                # OldShow and below: not a dir
+        ismount=lambda x: False)                                 # plain deleted folder, not a mount
+    assert n == 1 and p not in s.all_paths()
+    s.close()
+
+
+def test_prune_missing_files_keeps_offline_junction_subtree(tmp_path):
+    """§2 catastrophe PREVENTED (adversarially found): a nested junction to an OFFLINE target under a
+    mounted volume must NOT be mass-forgotten — its boundary reads as a mount/reparse point -> keep."""
+    s = FingerprintStore(tmp_path / "p.sqlite")
+    junction = str(tmp_path / "Media" / "NAS")
+    p = os.path.join(junction, "ep.mkv")
+    _save_file(s, p)
+    n = s.prune_missing_files(
+        exists=lambda x: not x.startswith(junction),             # volume/Media online; NAS unreachable
+        isdir=lambda x: not x.startswith(junction),              # NAS doesn't resolve (offline target)
+        ismount=lambda x: x == junction)                         # NAS IS a junction/mount
+    assert n == 0 and p in s.all_paths()                         # kept (an unmount is not a deletion)
+    s.close()
+
+
+def test_prune_missing_files_keeps_offline_drive(tmp_path):
+    """§2: a whole offline drive is skipped wholesale by the one-probe-per-volume guard."""
+    from dupdetect.store.store import _volume_root
+    s = FingerprintStore(tmp_path / "p.sqlite")
+    p = str(tmp_path / "x.mkv")
+    _save_file(s, p)
+    anchor = _volume_root(p)
+    n = s.prune_missing_files(exists=lambda x: x not in (anchor, p))   # the DRIVE itself reads offline
+    assert n == 0 and p in s.all_paths()
+    s.close()
+
+
+def test_prune_missing_files_noop_when_all_present(tmp_path):
+    s = FingerprintStore(tmp_path / "p.sqlite")
+    a, b = str(tmp_path / "a.mkv"), str(tmp_path / "b.mkv")
+    _save_file(s, a); _save_file(s, b)
+    n = s.prune_missing_files(exists=lambda x: True, isdir=lambda x: True, ismount=lambda x: False)
+    assert n == 0 and set(s.all_paths()) == {a, b}
+    s.close()
+
+
+def test_prune_missing_files_deterministic_via_injected_exists(tmp_path):
+    """§0: the decision core has no real-disk dependency — exactly the injected 'gone' subset is forgotten."""
+    s = FingerprintStore(tmp_path / "p.sqlite")
+    keep, drop = str(tmp_path / "keep.mkv"), str(tmp_path / "drop.mkv")
+    _save_file(s, keep); _save_file(s, drop)
+    n = s.prune_missing_files(exists=lambda x: x != drop, isdir=lambda x: True, ismount=lambda x: False)
+    assert n == 1 and s.all_paths() == [keep]
+    s.close()
+
+
+def test_volume_root_rejects_degenerate_anchors():
+    """Forms that would probe the WRONG location (and mass-forget) map to '' (unknown -> keep)."""
+    from dupdetect.store.store import _volume_root
+    if os.name == "nt":
+        assert _volume_root("C:\\Media\\x.mkv") == "C:\\"                    # proper drive root
+        assert _volume_root("\\\\srv\\share\\x.mkv") == "\\\\srv\\share\\"   # proper UNC share root
+        assert _volume_root("C:foo.mkv") == ""                              # drive-relative -> unknown
+        assert _volume_root("rel\\x.mkv") == ""                             # relative -> unknown
+    else:
+        assert _volume_root("/mnt/x/file.mkv") == "/"                       # POSIX single root
+        assert _volume_root("rel/x.mkv") == ""                             # relative -> unknown
+
+
 def test_reclassify_stale_on_reopen(tmp_path):
     """Old rows were all left as 'corrupt' (migration default). On reopening the store the
     category is recomputed from the error: a 'timeout' becomes 'reindex'."""

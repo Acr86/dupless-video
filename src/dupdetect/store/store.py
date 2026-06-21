@@ -277,6 +277,43 @@ class FingerprintStore:
             self.conn.commit()
         return len(gone)
 
+    def prune_missing_files(self, *, exists=os.path.exists, isdir=os.path.isdir,
+                            ismount=None) -> int:
+        """Self-heal (§2) for the DUPLICATES list — the UI counterpart of prune_missing_problems:
+        forget indexed files whose bytes are gone from disk, with a VOLUME + MOUNT-AWARE guard so an
+        offline drive or a disconnected nested mount/junction is NEVER mistaken for a mass deletion
+        (§0/§2), while a whole deleted SUBFOLDER on an ONLINE volume IS cleaned — the 'I deleted folders
+        but still see them' bug that orphan_paths' watched-ROOT guard misses (Mode B).
+
+        Two guards (both fail-SAFE — on doubt, keep the record; the file on disk is never touched and a
+        re-scan rebuilds a wrongly-forgotten record):
+          1. VOLUME fast-skip: group by volume anchor (`_volume_root`); one `exists(anchor)` probe per
+             drive/share. An unmounted drive (or an unknown/degenerate anchor) -> skip ALL its files.
+          2. MOUNT-AWARE per-file (`_real_deletion`): on a reachable volume, a gone file counts as a
+             real deletion only if NO disconnected mount/junction sits between it and the nearest present
+             directory; an offline sub-volume (its boundary reads as a mount/reparse point) is kept.
+
+        `exists`/`isdir`/`ismount` are injectable so the decision core is deterministic and unit-testable
+        without real drives/junctions (§0). Does NOT rebuild clusters (the caller owns that, like
+        actions.delete_files) and never touches the `problems` table. Returns how many were forgotten."""
+        ismount = ismount or _is_mount
+        by_anchor: dict[str, list[str]] = {}
+        for p in self.all_paths():
+            by_anchor.setdefault(_volume_root(p), []).append(p)
+        gone: list[str] = []
+        for anchor, paths in by_anchor.items():
+            if not _volume_reachable(anchor, exists):     # unknown form or offline drive -> keep all (§2)
+                continue
+            for p in paths:
+                try:
+                    if not exists(p) and _real_deletion(p, anchor, isdir, ismount):
+                        gone.append(p)                    # gone, volume online, no offline mount above
+                except OSError:
+                    pass                                  # dead UNC / weird path -> leave it (be safe)
+        for p in gone:
+            self.forget_file(p)                           # atomic: row + matches + cluster + .npy
+        return len(gone)
+
     def mark_repair_failed(self, path: str, kind: str, reason: str) -> None:
         """Persists the result of a FAILED remux attempt (previously the CLI only printed it
         -> the file would retry forever without ever explaining why). `kind='timeout'`
@@ -591,3 +628,60 @@ def canonical_path(p: str) -> str:
 def canonical_pair(a: str, b: str) -> tuple[str, str]:
     """C2: stable ordering of a pair so it is evaluated and stored ONCE."""
     return (a, b) if a <= b else (b, a)
+
+
+# --------------------------------------------------------------------------- file-existence self-heal
+# Helpers for prune_missing_files (the UI duplicates-list §2 self-heal). Kept module-level + injectable
+# so the decision core is deterministic and unit-testable without real drives/junctions (§0). The forms
+# rejected here were ADVERSARIALLY found to otherwise mass-forget records on offline storage.
+
+def _volume_root(path: str) -> str:
+    """The mountable VOLUME a path lives on, as a fail-safe anchor: a Windows DRIVE root ('L:\\') or a
+    UNC SHARE root ('\\\\srv\\share\\'), or POSIX '/'. Returns '' (UNKNOWN -> never touched) for forms
+    that would probe the WRONG thing and mass-forget: a relative/unanchored path, a drive-RELATIVE
+    anchor ('C:foo' -> 'C:', no root), or a degenerate single-separator 'UNC' ('\\' / '/x' whose anchor
+    is a bare separator that os.path.exists resolves to the current drive). Detect, don't trust."""
+    a = Path(path).anchor
+    if not a or a in ("\\", "/"):
+        return ""                                         # relative, or bare-separator (degenerate UNC)
+    if len(a) >= 2 and a[1] == ":" and not a.endswith(("\\", "/")):
+        return ""                                         # drive-relative 'C:foo' -> 'C:' (no root)
+    return a
+
+
+def _volume_reachable(anchor: str, exists) -> bool:
+    """Reachable iff the anchor is a KNOWN form AND present. Empty/unknown anchor is forced unreachable
+    so its files are never forgotten (fail-safe). One cheap probe per distinct drive/share."""
+    return bool(anchor) and bool(exists(anchor))
+
+
+def _is_mount(path: str) -> bool:
+    """True if `path` is a mount point or a (possibly disconnected) Windows junction/reparse point.
+    Never raises. is_junction reads the reparse ENTRY (in the still-online parent), so it flags a
+    junction even when its TARGET is offline -> that subtree is an unmount, NOT a deletion (§2)."""
+    try:
+        if os.path.ismount(path):
+            return True
+    except OSError:
+        pass
+    try:
+        return Path(path).is_junction()                   # Python 3.12+
+    except (OSError, AttributeError):
+        return False
+
+
+def _real_deletion(path: str, anchor: str, isdir, ismount) -> bool:
+    """On a reachable `anchor` volume, is a gone `path` a REAL deletion (forget it)? True only if every
+    still-missing ancestor between it and the nearest present directory is a PLAIN deleted folder —
+    never a disconnected mount/junction. A missing level that is a mount/reparse point is an OFFLINE
+    sub-volume whose whole subtree must be KEPT (§2); a plain missing folder was deleted on an online
+    volume (Mode B) -> forget. Walks up at most to `anchor`."""
+    cur = os.path.dirname(path)
+    while cur and cur != anchor and not isdir(cur):
+        if ismount(cur):
+            return False                                  # offline mount/junction above -> keep subtree
+        nxt = os.path.dirname(cur)
+        if nxt == cur:
+            break                                         # can't ascend further (defensive)
+        cur = nxt
+    return True

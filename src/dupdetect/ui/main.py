@@ -79,9 +79,12 @@ class MainWindow(QMainWindow):
         btn_recal = QPushButton("⚙ Recalibrate")
         btn_vlc = QPushButton("▶ Open in VLC")
         btn_del = QPushButton("🗑 Delete selection…")
+        btn_clean = QPushButton("🧹 Clean missing")
+        btn_clean.setToolTip("Remove files deleted outside the app from this list. "
+                             "Offline drives are skipped (never mistaken for a deletion).")
         bottom = QHBoxLayout()
         bottom.addWidget(self.sel_lbl); bottom.addStretch(1)
-        for b in (btn_recal, btn_vlc, btn_del):
+        for b in (btn_clean, btn_recal, btn_vlc, btn_del):
             bottom.addWidget(b)
 
         self.scan_panel = ScanPanel(db_path)
@@ -229,7 +232,10 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.watch_panel)                 # background watcher (keep updated)
         central = QWidget(); central.setLayout(lay); self.setCentralWidget(central)
 
-        refresh.clicked.connect(self.refresh)
+        # ↻ and "Clean missing" RE-CHECK the disk (forget files deleted outside the app); the per-
+        # keystroke/filter signals (sort/filt/search) stay on the plain refresh -> NO disk sweep on typing.
+        refresh.clicked.connect(self._refresh_with_prune)
+        btn_clean.clicked.connect(self._refresh_with_prune)
         self.sort.currentIndexChanged.connect(self.refresh)
         self.filt.currentIndexChanged.connect(self.refresh)
         self.search.textChanged.connect(self.refresh)
@@ -242,7 +248,7 @@ class MainWindow(QMainWindow):
         _ver.setStyleSheet("color: gray;")
         _ver.setToolTip("Dupless Video version")
         self.statusBar().addPermanentWidget(_ver)
-        self.refresh()
+        self._refresh_with_prune()                      # on open: reconcile the list with disk first
         QTimer.singleShot(0, self._maybe_onboard)       # one-time intro (after the window is shown)
         if startup.is_enabled() and self.watch_panel.folder.text().strip():
             QTimer.singleShot(1500, self._autostart_watch)   # resume watching when launched at login
@@ -257,6 +263,29 @@ class MainWindow(QMainWindow):
             self._settings.setValue("db_path", db)       # remember the active DB across sessions
             self.watch_panel.set_db(db)                  # watcher follows the active DB
             self.setWindowTitle(f"Dupless Video · Duplicates — {db}")
+        self._refresh_with_prune()                       # new DB: reconcile its list with disk too
+
+    def _refresh_with_prune(self):
+        """Reconcile the duplicates list with disk, then refresh. Forgets files deleted OUTSIDE the app
+        (the watcher may not be running) using the store's volume+mount-aware guard, then rebuilds only
+        the clusters a removal touched (reuse -> no whisper/audio on the rest) and reloads. Wired to
+        OPEN, switch_db, the ↻ button and 'Clean missing' — NEVER the per-keystroke filter signals.
+
+        SKIPPED while a user SCAN holds the priority lock: the scan is re-persisting matches and owns the
+        disk, so we neither race its concurrent-deletion guard (§0) nor compete for the HDD (§1); the
+        next open/refresh (or the watcher) reconciles once it finishes. A failure here must never break
+        the view -> on any error fall back to a plain refresh (§2)."""
+        try:
+            from dupdetect.runtime import scan_in_progress
+            if scan_in_progress():
+                self.refresh(); return
+            from dupdetect.config import load_thresholds
+            from dupdetect.pipeline.fullscan import _rebuild_clusters, _snapshot_clusters
+            prior = _snapshot_clusters(self.store)       # reuse ranking of UNCHANGED clusters (cheap)
+            if self.store.prune_missing_files():         # forgot >=1 file -> the match graph changed
+                _rebuild_clusters(self.store, load_thresholds(), reuse=prior)
+        except Exception:                                # noqa: BLE001 — reconcile must not break the UI
+            pass
         self.refresh()
 
     def _on_watch_dups(self, n: int):
