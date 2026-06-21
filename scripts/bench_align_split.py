@@ -43,22 +43,28 @@ def _best(fn):
 
 
 def main() -> None:
-    print(f"band_radius={BAND} frames (={BAND * GRID_S / 60:.0f} min), D={D}, BLAS=1 thread\n")
-    print(f"{'N':>6} {'runtime':>8} {'mm_full_ms':>11} {'mm_band_ms':>11} {'mm_x':>6} "
-          f"{'DP_ms':>9} {'pair_full':>10} {'pair_band':>10}")
+    import dupdetect.align.video as _v
+    has_fast = _v._banded_align_fast is not None
+    print(f"band_radius={BAND} frames, D={D}, BLAS=1 thread, cython_DP={has_fast}\n")
+    print(f"{'N':>6} {'runtime':>8} {'mm_full':>8} {'mm_band':>8} {'DP_pure':>8} {'DP_fast':>8} "
+          f"{'before':>8} {'after':>8} {'speedup':>8}")
     for n in _NS:
         a, b = _rand_unit(n, 0), _rand_unit(n, 1)             # distinct seeds -> not a trivial diagonal
         t_mm, sim = _best(lambda a=a, b=b: a @ b.T)            # FULL matmul (today's worker path)
         t_bmm, _ = _best(lambda a=a, b=b: _banded_matmul(a, b, BAND))   # 3a: band only (giants)
-        t_dp, _ = _best(lambda sim=sim: banded_align(sim, BAND))   # casts to f64 internally, like prod
-        speed = t_mm / t_bmm if t_bmm else 1.0
-        pair_full = 1000 * (t_mm + t_dp)
-        pair_band = 1000 * (t_bmm + t_dp)
-        print(f"{n:6d} {n * GRID_S / 60:6.0f}m {1000 * t_mm:11.1f} {1000 * t_bmm:11.1f} {speed:5.1f}x "
-              f"{1000 * t_dp:9.1f} {pair_full:9.0f}ms {pair_band:9.0f}ms")
-    print(f"\nmatmul is O(N^2*D); banded matmul (3a) is ~O(N*band) -> wins as N grows past the "
-          f"_BANDED_MATMUL_MIN_N gate (2400). pair_* = matmul + DP per pair (DP still on the table for "
-          f"the Cython/3b pass). band_radius={BAND}.")
+        t_dp_fast, _ = _best(lambda sim=sim: banded_align(sim, BAND))   # 3b: Cython DP (if compiled)
+        save = _v._banded_align_fast
+        _v._banded_align_fast = None                          # force the pure-Python DP for baseline
+        t_dp_pure, _ = _best(lambda sim=sim: banded_align(sim, BAND))
+        _v._banded_align_fast = save
+        before = t_mm + t_dp_pure                             # baseline: full matmul + pure-Python DP
+        after = t_bmm + t_dp_fast                             # all levers: banded matmul + Cython DP
+        print(f"{n:6d} {n * GRID_S / 60:6.0f}m {1000 * t_mm:7.1f} {1000 * t_bmm:7.1f} "
+              f"{1000 * t_dp_pure:7.1f} {1000 * t_dp_fast:7.1f} {1000 * before:7.0f} {1000 * after:7.0f} "
+              f"{before / after if after else 1.0:6.1f}x")
+    print("\nbefore = full matmul + pure-Python DP (baseline); after = banded matmul (3a) + Cython DP (3b)."
+          "\nDP_pure carries the numpy per-row overhead the Cython port removes. scenes DTW (also "
+          "Cythonized) is a separate ~34% of real Pass-2, not in this video-only microbench.")
 
 
 if __name__ == "__main__":

@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "ruff>=0.4", "mypy>=1.10"]
+dev = ["pytest>=8.0", "ruff>=0.4", "mypy>=1.10", "Cython>=3.0"]
 ui = ["PySide6>=6.7", "send2trash>=1.8", "opencv-python-headless>=4.8"]   # `dupdetect ui`: Qt app + live-view JPEG encode (cv2.imencode)
 # OPTIONAL: native filesystem events for the watcher (ReadDirectoryChangesW / inotify / FSEvents).
 # Without it the watcher still works via backoff polling; with it: instant reaction + minimal churn.
@@ -33,7 +33,9 @@ dupdetect = "dupdetect.cli:app"
 "dupdetect.ui" = ["*.ico", "*.png"]   # the icon ships with the package (also in a non-editable install)
 
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+# Cython compiles the optional Pass-2 hot-loop accelerator (align/_fastdp.pyx). It is marked
+# optional in setup.py, so a build without a C compiler still succeeds (pure-Python fallback).
+requires = ["setuptools>=68", "wheel", "Cython>=3.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]

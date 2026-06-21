@@ -16,6 +16,21 @@ av = pytest.importorskip("av")
 
 # --------------------------------------------------------------- align_scenes
 
+def test_align_scenes_fast_equals_pure(monkeypatch):
+    """The compiled DTW fill (Cython _fastdp) yields the IDENTICAL score to the pure-Python
+    reference -> verdict unchanged (§0). Skipped when the extension isn't built."""
+    import dupdetect.align.scenes as s
+    if s._scenes_dtw_final is None:
+        pytest.skip("Cython _fastdp not compiled")
+    rng = np.random.default_rng(5)
+    ca = np.cumsum(np.abs(rng.standard_normal(120)) + 0.5)
+    cb = np.cumsum(np.abs(rng.standard_normal(118)) + 0.5)
+    fast = align_scenes(ca, cb)
+    monkeypatch.setattr(s, "_scenes_dtw_final", None)        # force the pure-Python DTW fill
+    pure = align_scenes(ca, cb)
+    assert fast.score == pure.score and fast.coverage == pure.coverage
+
+
 def test_identical_cuts_high_score():
     cuts = np.array([10.0, 25.0, 40.0, 80.0, 95.0], dtype=np.float32)
     r = align_scenes(cuts, cuts)

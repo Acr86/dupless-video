@@ -6,6 +6,31 @@ import numpy as np
 
 from dupdetect.models import AlignResult
 
+# Optional compiled DTW fill (Cython). Pure speedup -> identical score (§0); pure-Python fallback
+# (_dtw_final_py) keeps the app correct when the extension isn't built (§2). See align/_fastdp.pyx.
+try:
+    from dupdetect.align._fastdp import scenes_dtw_final as _scenes_dtw_final
+except ImportError:                                # noqa: BLE001 — not compiled -> pure-Python path
+    _scenes_dtw_final = None
+
+
+def _dtw_final_py(ia: np.ndarray, ib: np.ndarray, n: int, m: int,
+                  band: int, gap_penalty: float) -> float:
+    """Pure-Python DTW fill (reference + fallback): returns d[n, m]. Same float64 recurrence the
+    compiled scenes_dtw_final ports, so the score is identical (§0)."""
+    eps = 1e-6
+    d = np.full((n + 1, m + 1), np.inf)
+    d[0, 0] = 0.0
+    for i in range(1, n + 1):
+        ai = max(0.0, ia[i - 1])                                    # non-negative intervals
+        for j in range(max(1, i - band), min(m, i + band) + 1):     # within band only
+            bj = max(0.0, ib[j - 1])
+            cost = min(1.0, abs(ai - bj) / (ai + bj + eps))         # relative diff, bounded [0,1]
+            d[i, j] = cost + min(d[i - 1, j - 1],                   # diagonal (no gap)
+                                 d[i - 1, j] + gap_penalty,         # deletion (gap)
+                                 d[i, j - 1] + gap_penalty)         # insertion (gap)
+    return float(d[n, m])
+
 
 def align_scenes(cuts_a: np.ndarray, cuts_b: np.ndarray, theta: float = 0.70,
                  band_frac: float = 0.2, gap_penalty: float = 0.2,
@@ -35,19 +60,11 @@ def align_scenes(cuts_a: np.ndarray, cuts_b: np.ndarray, theta: float = 0.70,
     if abs(n - m) > band:                          # incompatible lengths -> no match
         return AlignResult(0.0, coverage=coverage)
 
-    eps = 1e-6
-    d = np.full((n + 1, m + 1), np.inf)
-    d[0, 0] = 0.0
-    for i in range(1, n + 1):
-        ai = max(0.0, ia[i - 1])                                    # non-negative intervals
-        for j in range(max(1, i - band), min(m, i + band) + 1):     # within band only
-            bj = max(0.0, ib[j - 1])
-            cost = min(1.0, abs(ai - bj) / (ai + bj + eps))         # relative diff, bounded [0,1]
-            d[i, j] = cost + min(d[i - 1, j - 1],                   # diagonal (no gap)
-                                 d[i - 1, j] + gap_penalty,         # deletion (gap)
-                                 d[i, j - 1] + gap_penalty)         # insertion (gap)
-
-    final = d[n, m]
+    if _scenes_dtw_final is not None:              # compiled DTW fill (perf §1); identical score (§0)
+        final = _scenes_dtw_final(np.ascontiguousarray(ia), np.ascontiguousarray(ib),
+                                  int(band), float(gap_penalty))
+    else:
+        final = _dtw_final_py(ia, ib, n, m, band, gap_penalty)
     if not np.isfinite(final):                     # (n,m) outside band -> no path
         return AlignResult(0.0, coverage=coverage)
     # normalize by max(n,m): gaps add to cost without inflating the divisor -> they penalize

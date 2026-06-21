@@ -16,6 +16,13 @@ import numpy as np
 
 from dupdetect.models import AlignResult
 
+# Optional compiled hot loop (Cython). Pure speedup -> identical result (§0); pure-Python fallback
+# below keeps the app correct when the extension isn't built (§2). See align/_fastdp.pyx.
+try:
+    from dupdetect.align._fastdp import banded_align_fast as _banded_align_fast
+except ImportError:                                # noqa: BLE001 — not compiled -> pure-Python path
+    _banded_align_fast = None
+
 
 def resample_to_grid(emb, ts, step: float, end: float | None = None):
     """Resamples (emb[N,D], ts[N] in s) to a UNIFORM temporal grid [0, end] with step
@@ -149,10 +156,12 @@ def banded_align(sim, band_radius: int, gap_penalty: float = 0.3,
     +gp*pos / -gp*pos round-trip is exact enough that the strict '>' (with epsilon) doesn't mark
     spurious LEFT on the main diagonal.
     """
-    sim = np.asarray(sim, dtype=np.float64)
+    sim = np.ascontiguousarray(sim, dtype=np.float64)
     na, nb = int(sim.shape[0]), int(sim.shape[1])
     if na == 0 or nb == 0:
         return None
+    if _banded_align_fast is not None:             # compiled scalar port (perf §1); identical path (§0)
+        return _banded_align_fast(sim, int(band_radius), float(gap_penalty), float(match_threshold))
     r = int(band_radius)
     W = 2 * r + 1
     pos = np.arange(W, dtype=np.float64)                        # position within the band

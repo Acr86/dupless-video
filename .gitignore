@@ -54,6 +54,10 @@ env/
 # --- Build / packaging output (PyInstaller, wheels, Inno Setup) ---
 build/
 dist/
+# Compiled Cython extension + its generated C (built from align/_fastdp.pyx; source-only in git)
+*.pyd
+*.so
+src/dupdetect/align/_fastdp.c
 # auto-generated specs are ignored; the hand-written one is force-kept below
 *.spec
 !dupless-video.spec

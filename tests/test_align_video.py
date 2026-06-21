@@ -160,6 +160,23 @@ def test_banded_matmul_band_equals_full():
                 assert bm[i, j] == pytest.approx(full[i, j], abs=1e-4)
 
 
+def test_banded_align_fast_equals_pure(monkeypatch):
+    """The compiled banded DP (Cython _fastdp) returns the IDENTICAL path to the pure-Python
+    reference -> verdict unchanged (§0). Skipped when the extension isn't built (pure-Python only)."""
+    import dupdetect.align.video as v
+    if v._banded_align_fast is None:
+        pytest.skip("Cython _fastdp not compiled")
+    rng = np.random.default_rng(3)
+    sim = rng.standard_normal((300, 320)).astype(np.float64)
+    for i in range(300):
+        sim[i, min(i + 2, 319)] += 2.0                       # a clear diagonal so a path exists
+    fast = banded_align(sim, band_radius=40)
+    monkeypatch.setattr(v, "_banded_align_fast", None)       # force the pure-Python body
+    pure = banded_align(sim, band_radius=40)
+    assert (fast is None) == (pure is None)
+    assert np.array_equal(fast, pure)
+
+
 def test_align_video_banded_matmul_matches_full(monkeypatch):
     """align_video's banded-matmul path (giants, numpy) yields the SAME AlignResult as the full
     matmul -> verdict invariant (§0). Force each path by moving the gate; numpy inputs so the banded
