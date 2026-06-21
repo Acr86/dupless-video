@@ -11,6 +11,41 @@ Newest on top. Append-only in spirit. Deep rationale for the design invariants l
 
 ## Entries
 
+### Pass-2 (candidate matching) ETA ~8h / "is the parallel pass even using the cores?"
+- **Symptom:** a full scan sat in Pass-2 at ~59 pair/s, ETA ~8h for 1.9M candidate pairs (~19k files,
+  library on a spinning HDD). The in-code comment claimed Pass-2 was "COMPUTE-bound (banded DP ~89%),
+  scales across cores" — but 30 workers were yielding only 59 pair/s.
+- **Root cause (MEASURED — two assumptions overturned):** (1) NOT I/O-bound: embeddings are 18 GB of
+  small fp16 `.npy` on an **NVMe** (C:), with 128 GB RAM → the whole set fits in page cache, so the
+  per-pair re-read is free (the HDD holds the *videos*, read in Pass-1, not the embeddings). The
+  "obvious" cache/locality fix would buy nothing. (2) The real costs, by a synthetic N-sweep + a
+  per-stage profile (`scripts/bench_align_split.py`, `scripts/profile_pass2.py`, BLAS pinned to 1
+  thread): the per-pair **similarity matmul `a@b.T` is only ~3-5%** for typical content; the
+  **banded Smith-Waterman DP (`align_video.banded_align`) is ~78-95%** of `align_video`, and the
+  **scenes DTW (`align_scenes`) is a separate ~34%** of total Pass-2 — both pure-Python numeric loops.
+  Plus **OpenBLAS thread oversubscription**: 30 worker processes × a multi-threaded matmul (no cap) =
+  ~30×32 threads on 32 cores. The matmul/DP split FLIPS with duration: matmul is O(N²) vs the DP's
+  O(N·band), so it only overtakes the DP past ~N=8000 (~4.5 h runtime) — relevant as the library
+  trends to long 4K/8K (N = duration/grid, resolution-INDEPENDENT). **GPU offload of the matmul was
+  rejected**: it reaches only the ~3% matmul and would need to ship sim/band matrices to the CPU DP
+  workers (~12 TB IPC) — a net loss (the DP can't go on GPU; per-row GPU kernels measured ~15× slower).
+- **Resolution (three levers, all §0-invariant, measured):** (1) **Pin BLAS to 1 thread/worker** around
+  the Pass-2 pool (`matcher.single_threaded_blas`, env set in the parent before spawn) — parallelism
+  comes from the processes. (2) **Banded matmul** for `min(na,nb) > 2400`: fill only the diagonal band
+  the DP reads via row-block GEMMs (`align/video._banded_matmul`); `banded_align` is unchanged →
+  identical path. N=8000 matmul 1087→255 ms (4.3×). (3) **Cython** the two hot loops
+  (`align/_fastdp.pyx`: `banded_align_fast`, `scenes_dtw_final`) — typed memoryviews, pure-Python
+  fallbacks kept as reference; DP 904→253 ms at N=8000 (and 61→8 ms at N=500). Combined per-pair
+  video-align **3.1-4.7× faster** (giant pair 1926→477 ms), verified bit-identical (randomized
+  fast==pure, 0 mismatches/200). The Cython ext is OPTIONAL (`Extension(optional=True)` + import
+  fallback): no compiler → pure-Python, nothing breaks; PyInstaller bundles the `.pyd` only if built.
+- **Files / refs:** `match/matcher.py` (`single_threaded_blas`, `_pass2_init`); `align/video.py`
+  (`_banded_matmul`, `_BANDED_MATMUL_MIN_N`, `banded_align` dispatch); `align/scenes.py`
+  (`_dtw_final_py` + dispatch); `align/_fastdp.pyx`; `setup.py`; `scripts/bench_align_split.py`,
+  `scripts/profile_pass2.py`; tests `test_align_video.py`, `test_scenes.py`, `test_perf_opts.py`.
+- **Scope:** decided 2026-06-21. NOT yet measured end-to-end (a real multi-hour scan); the per-stage
+  microbenchmarks quantify the per-pair win. Block size 256 / gate 2400 chosen by the bench, not tuned.
+
 ### Phantom duplicate records: same file under '/' and '\' paths (Windows)
 - **Symptom:** the DB shows the SAME file twice (inflated index, even a file "duplicate" of itself).
   Diagnosis: some `files.path` were like `L:/Media/Adult\Flat\x.mp4` (root with '/', rest with '\')
