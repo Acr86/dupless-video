@@ -15,6 +15,25 @@ from dupdetect.store import FingerprintStore
 from dupdetect.ui.data import ClusterRow, FileRow, clean_title, is_actionable, load_clusters, sort_clusters
 
 
+@pytest.fixture(autouse=True)
+def _isolate_qsettings(tmp_path_factory, monkeypatch):
+    """UI tests must NOT touch the user's REAL QSettings (the shared HKCU 'Dupless Video' key): a stray
+    `switch_db` persists a temp `db_path` into it (so the real app then reopens a deleted pytest DB),
+    and a constructed MainWindow reads `watch_folder` and AUTOSTARTS a real watcher on the user's
+    library — a subprocess that leaks past pytest. NOTE: `QSettings(org, app)` uses NativeFormat (the
+    Windows registry) regardless of setDefaultFormat, so we patch the name MainWindow constructs
+    through to return a throwaway INI-backed QSettings under tmp -> fully isolated, and an empty
+    `watch_folder` means no autostart. No-op without Qt."""
+    try:
+        import dupdetect.ui.main as _m
+        from PySide6.QtCore import QSettings
+    except ImportError:
+        return
+    QSettings.setPath(QSettings.IniFormat, QSettings.UserScope, str(tmp_path_factory.mktemp("qset")))
+    monkeypatch.setattr(_m, "QSettings", lambda *a, **k: QSettings(
+        QSettings.IniFormat, QSettings.UserScope, "DuplessTest", "DuplessTest"))
+
+
 def test_clean_title_strips_release_tags():
     assert clean_title("Sample.Movie.1999.1080p.BluRay.x264-GROUP.mkv") == "Sample Movie 1999"
     assert clean_title("Another Film (2002) [1080p] WEB-DL DTS.mp4") == "Another Film 2002"
