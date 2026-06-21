@@ -144,6 +144,44 @@ def test_banded_align_no_alignment_returns_none():
     assert banded_align(sim, band_radius=5) is None
 
 
+# --------------------------------------------------------------- banded matmul (3a: giants) — §0
+def test_banded_matmul_band_equals_full():
+    """The banded matmul fills exactly the diagonal band the DP reads, bit-faithful to the full a@b.T
+    on those cells (off-band cells are never read). Multi-block (na > block=256) so the slab logic runs."""
+    from dupdetect.align.video import _banded_matmul
+    a, b = _vocab(1000, seed=1), _vocab(1000, seed=2)
+    r, nb = 100, b.shape[0]
+    full = a @ b.T
+    bm = _banded_matmul(a, b, r)
+    for i in (0, 1, r, 256, 257, 500, 999):                  # incl. block boundaries (block=256)
+        for d in range(-r, r + 1):
+            j = i + d
+            if 0 <= j < nb:
+                assert bm[i, j] == pytest.approx(full[i, j], abs=1e-4)
+
+
+def test_align_video_banded_matmul_matches_full(monkeypatch):
+    """align_video's banded-matmul path (giants, numpy) yields the SAME AlignResult as the full
+    matmul -> verdict invariant (§0). Force each path by moving the gate; numpy inputs so the banded
+    branch runs (torch inputs go to the GPU full-matmul path). Scenario exercises offset + superset."""
+    import dupdetect.align.video as v
+    film = list(range(600))
+    a = VOCAB[np.array(film)]                                # numpy -> banded branch
+    b = VOCAB[np.array(list(range(1500, 1510)) + film + list(range(1600, 1660)))]  # +10 offset, +60 tail
+    monkeypatch.setattr(v, "_BANDED_MATMUL_MIN_N", 10 ** 9)  # force FULL matmul
+    full = align_video(a, b, fps=2.0, band_radius=60)
+    monkeypatch.setattr(v, "_BANDED_MATMUL_MIN_N", 0)        # force BANDED matmul
+    banded = align_video(a, b, fps=2.0, band_radius=60)
+    assert banded.score == pytest.approx(full.score, abs=1e-6)
+    assert banded.offset == pytest.approx(full.offset, abs=1e-6)
+    assert banded.coverage == pytest.approx(full.coverage, abs=1e-6)
+    assert banded.contiguous_superset == full.contiguous_superset
+    assert banded.superset_dir == full.superset_dir
+    assert banded.extra_ratio == pytest.approx(full.extra_ratio, abs=1e-6)
+    assert banded.interleaved_ratio == pytest.approx(full.interleaved_ratio, abs=1e-6)
+    assert banded.ad_dir == full.ad_dir
+
+
 # --------------------------------------------------------------- _detect_superset directo
 
 def test_detect_superset_dup_is_not_superset():

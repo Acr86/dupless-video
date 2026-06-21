@@ -42,6 +42,49 @@ def resample_to_grid(emb, ts, step: float, end: float | None = None):
     return emb[sel]
 
 
+# min(na, nb) above which the similarity matmul is computed BANDED (only the diagonal stripe the DP
+# reads) instead of full N*N. Below it, the full matmul is cheaper (banding's per-block overhead and a
+# single block ~= full anyway). Banding only pays when N >> band; the duration gate keeps na ~= nb, so
+# min() is the right axis. Measured (bench_align_split): matmul is O(N^2) and overtakes the O(N*band) DP
+# only past long runtimes (~N>=5000), so this targets the 4K/8K-long tail. Test monkeypatches it.
+_BANDED_MATMUL_MIN_N = 2400
+
+
+def _banded_matmul(a: np.ndarray, b: np.ndarray, r: int, block: int = 256) -> np.ndarray:
+    """Similarity matrix [na, nb] with ONLY the Sakoe-Chiba band |i-j| <= r filled (the rest left
+    uninitialized): banded_align reads sim ONLY at clip(i-r .. i+r), so the off-band cells are never
+    touched. Computes the band as a few row-block GEMMs over the narrow column slab each block's band
+    spans -> O(N*(block+2r)) work instead of O(N^2*D), the giant-file win (matmul goes from O(N^2) to
+    ~O(N*band)). Bit-faithful to a@b.T on the band cells (each cell is the same independent dot product;
+    under 1 BLAS thread, deterministic). align_video keeps using the unchanged banded_align on the
+    result, so the DP/verdict are identical (§0)."""
+    na, nb = int(a.shape[0]), int(b.shape[0])
+    sim = np.empty((na, nb), dtype=np.float32)         # off-band cells stay garbage -> never read
+    for i0 in range(0, na, block):
+        i1 = min(i0 + block, na)
+        jlo = max(0, i0 - r)                           # leftmost band column for row i0
+        jhi = min(nb, (i1 - 1) + r + 1)                # rightmost band column for row i1-1 (+1)
+        sim[i0:i1, jlo:jhi] = a[i0:i1] @ b[jlo:jhi].T  # every band cell of these rows lands in the slab
+    return sim
+
+
+def _similarity_matrix(emb_a, emb_b, band_radius: int) -> np.ndarray:
+    """Cosine similarity [na, nb] of two L2-normalized per-frame sequences (already unit vectors).
+    torch CUDA tensor -> matmul on device then numpy (sequential GPU path); numpy -> BANDED matmul for
+    giants (Pass-2 workers, O(N*band)), full a@b.T otherwise. Empty inputs -> [0,0]."""
+    if hasattr(emb_a, "is_cuda"):                  # torch tensor: matmul on its device, then numpy
+        if emb_a.numel() == 0 or emb_b.numel() == 0:   # empty tensor: `.size` is a METHOD here
+            return np.empty((0, 0), dtype=np.float32)
+        return (emb_a.float() @ emb_b.t().float()).cpu().numpy()
+    a = np.asarray(emb_a, dtype=np.float32)        # numpy (Pass-2 worker path: no torch)
+    b = np.asarray(emb_b, dtype=np.float32)
+    if not (a.size and b.size):
+        return np.empty((0, 0), dtype=np.float32)
+    if min(a.shape[0], b.shape[0]) > _BANDED_MATMUL_MIN_N:
+        return _banded_matmul(a, b, band_radius)   # giants: band the matmul (O(N*band), not O(N^2))
+    return a @ b.T
+
+
 def align_video(emb_a, emb_b, fps: float = 2.0, band_radius: int = 600,
                 superset_extra_ratio: float = 0.08, min_ad_run_s: float = 10.0) -> AlignResult:
     """Aligns two per-frame embedding sequences (torch CUDA tensors OR numpy arrays).
@@ -59,15 +102,7 @@ def align_video(emb_a, emb_b, fps: float = 2.0, band_radius: int = 600,
     band_radius (frames) = max_offset_s * fps (e.g. 300 s * 2 fps = 600). Ad offset is bounded to
     minutes, so capping the band to ±600 frames makes the DP linear instead of quadratic.
     """
-    if hasattr(emb_a, "is_cuda"):                  # torch tensor: matmul on its device, then numpy
-        if emb_a.numel() == 0 or emb_b.numel() == 0:   # empty tensor: `.size` is a METHOD here, so
-            sim = np.empty((0, 0), dtype=np.float32)   # mirror the numpy branch's emptiness guard
-        else:
-            sim = (emb_a.float() @ emb_b.t().float()).cpu().numpy()
-    else:                                          # numpy (Pass-2 worker path: no torch)
-        a = np.asarray(emb_a, dtype=np.float32)
-        b = np.asarray(emb_b, dtype=np.float32)
-        sim = a @ b.T if a.size and b.size else np.empty((0, 0), dtype=np.float32)
+    sim = _similarity_matrix(emb_a, emb_b, band_radius)
     if sim.size == 0:
         return AlignResult(score=0.0)
 
