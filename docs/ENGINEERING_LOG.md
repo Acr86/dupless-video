@@ -45,8 +45,12 @@ Newest on top. Append-only in spirit. Deep rationale for the design invariants l
   one is forgotten, the present one kept, the orphaned cluster collapses.
 - **Files / refs:** `store.py` `prune_missing_files` + `_volume_root`/`_volume_reachable`/`_is_mount`/
   `_real_deletion`; `ui/main.py` `_refresh_with_prune` + "Clean missing" button; tests in
-  `test_perf_opts.py`, `test_ui.py`. FOLLOW-UP: the watcher `_full_sweep` can adopt the same guard to
-  close Mode B in the background (needs normcase alignment with `orphan_paths` + its own test).
+  `test_perf_opts.py`, `test_ui.py`. The watcher's `_full_sweep` (watch.py) now ALSO calls
+  `prune_missing_files` (after `orphan_paths`, gated by `scan_in_progress` so it never races a scan /
+  fights the HDD), closing Mode B in the background too — `orphan_paths` handles files under a present
+  root, the volume-prune catches files whose root vanished while the drive stayed online. The feared
+  normcase divergence is moot: `os.path.exists` is case-insensitive on Windows, so a differently-cased
+  stored path still resolves and is not spuriously forgotten. Tests in `test_watch.py`.
 - **Scope:** decided 2026-06-21.
 
 ### Pass-2 (candidate matching) ETA ~8h / "is the parallel pass even using the cores?"

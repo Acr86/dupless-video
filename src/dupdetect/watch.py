@@ -188,11 +188,21 @@ def _full_sweep(targets, store: FingerprintStore) -> int:
     """Robust but O(library) deletion sweep: forget every indexed file under a REACHABLE watched root
     that is gone from disk. The §2 root-reachable guard (in `orphan_paths`) keeps an offline drive
     from reading as a mass deletion. This is the STARTUP catch-up + periodic backstop for missed FS
-    events + the no-watchdog fallback — NOT a per-cycle operation."""
+    events + the no-watchdog fallback — NOT a per-cycle operation.
+
+    COMPLEMENT (Mode B): `orphan_paths` skips a file whose whole watched ROOT was deleted (its root
+    guard sees the root gone and bows out, so an unmounted drive isn't read as a deletion). The store's
+    `prune_missing_files` catches exactly those — it guards by VOLUME + nested mount/junction instead of
+    watched root, so a deleted folder on an ONLINE drive is cleaned while an offline drive/mount is left
+    alone. Run it only when NO scan holds the lock: a scan is re-persisting matches (don't race its
+    concurrent-deletion guard, §0) and owns the disk (don't add an O(library) stat sweep to the HDD
+    contention, §1) — the next backstop sweep, or the UI's own prune, reconciles after the scan."""
     removed = 0
     for p in orphan_paths(targets, store):
         store.forget_file(p)
         removed += 1
+    if not scan_in_progress():
+        removed += store.prune_missing_files()         # Mode B: root gone but volume online (§0/§1 gated)
     return removed
 
 

@@ -106,6 +106,34 @@ def test_orphan_paths_skips_unreachable_root(tmp_path):
     s.close()
 
 
+def test_full_sweep_closes_mode_b_deleted_root_volume_online(tmp_path, monkeypatch):
+    """Mode B in the background: `orphan_paths` SKIPS a whole DELETED watched root (its root guard sees
+    the root gone, so an unmount isn't read as a deletion), but `_full_sweep` then runs the store's
+    VOLUME-guarded `prune_missing_files`, which cleans the files since the drive is still mounted —
+    closing the blind spot orphan_paths leaves open. scan gate forced off for isolation."""
+    monkeypatch.setattr(watch, "scan_in_progress", lambda: False)
+    s = FingerprintStore(tmp_path / "w.sqlite")
+    root = tmp_path / "Media"                                    # never created on disk == deleted root
+    s.save(_rec(root / "ep.mkv"), feature_version="fv")          # indexed under the (now gone) root
+    assert watch.orphan_paths(str(root), s) == []               # orphan_paths bows out (root unreachable)
+    removed = watch._full_sweep([str(root)], s)                 # the full sweep prunes by VOLUME instead
+    assert removed == 1 and str(root / "ep.mkv") not in s.all_paths()
+    s.close()
+
+
+def test_full_sweep_skips_prune_during_scan(tmp_path, monkeypatch):
+    """§0/§1: the backstop volume-prune is SKIPPED while a scan holds the lock — don't race Pass-2's
+    re-persist guard or add an O(library) stat sweep to the HDD the scan is reading. The next backstop
+    sweep (or the UI prune) reconciles once the scan finishes."""
+    monkeypatch.setattr(watch, "scan_in_progress", lambda: True)
+    s = FingerprintStore(tmp_path / "w.sqlite")
+    p = tmp_path / "Media" / "ep.mkv"
+    s.save(_rec(p), feature_version="fv")                        # Mode B file, never on disk
+    removed = watch._full_sweep([str(tmp_path / "Media")], s)
+    assert removed == 0 and str(p) in s.all_paths()             # kept until the scan releases the lock
+    s.close()
+
+
 @pytest.mark.skipif(os.name != "nt", reason="paths are case-insensitive only on Windows")
 def test_orphan_paths_case_insensitive_root_on_windows(tmp_path):
     """Windows: a watch root whose CASE differs from the indexed path (the FS is case-insensitive)
