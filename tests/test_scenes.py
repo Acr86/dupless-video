@@ -18,17 +18,20 @@ av = pytest.importorskip("av")
 
 def test_align_scenes_fast_equals_pure(monkeypatch):
     """The compiled DTW fill (Cython _fastdp) yields the IDENTICAL score to the pure-Python
-    reference -> verdict unchanged (§0). Skipped when the extension isn't built."""
+    reference across many random cut signatures -> verdict unchanged (§0). Skipped when not built."""
     import dupdetect.align.scenes as s
     if s._scenes_dtw_final is None:
         pytest.skip("Cython _fastdp not compiled")
-    rng = np.random.default_rng(5)
-    ca = np.cumsum(np.abs(rng.standard_normal(120)) + 0.5)
-    cb = np.cumsum(np.abs(rng.standard_normal(118)) + 0.5)
-    fast = align_scenes(ca, cb)
-    monkeypatch.setattr(s, "_scenes_dtw_final", None)        # force the pure-Python DTW fill
-    pure = align_scenes(ca, cb)
-    assert fast.score == pure.score and fast.coverage == pure.coverage
+    fast_fn = s._scenes_dtw_final
+    for seed in range(12):
+        rng = np.random.default_rng(1000 + seed)
+        ca = np.cumsum(np.abs(rng.standard_normal(int(rng.integers(5, 200)))) + 0.3)
+        cb = np.cumsum(np.abs(rng.standard_normal(int(rng.integers(5, 200)))) + 0.3)
+        monkeypatch.setattr(s, "_scenes_dtw_final", fast_fn)
+        fast = align_scenes(ca, cb)
+        monkeypatch.setattr(s, "_scenes_dtw_final", None)    # force the pure-Python DTW fill
+        pure = align_scenes(ca, cb)
+        assert fast.score == pure.score and fast.coverage == pure.coverage
 
 
 def test_identical_cuts_high_score():
