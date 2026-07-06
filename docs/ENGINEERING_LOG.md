@@ -11,6 +11,49 @@ Newest on top. Append-only in spirit. Deep rationale for the design invariants l
 
 ## Entries
 
+### Review sweep: Problems-tab ghosts (Mode B), POSIX prune was a silent no-op, M4 move-clone, UI prune off the GUI thread
+- **Symptom:** a code review of the file-existence reconciliation found residual holes after the
+  2026-06-21 fix: (a) the Problems tab kept ghost rows for files whose whole FOLDER was deleted;
+  (b) `_volume_root` rejected the POSIX anchor `/`, making `prune_missing_files` a silent NO-OP on
+  Linux (its own committed tests — `test_perf_opts` POSIX branch, `test_full_sweep_closes_mode_b` —
+  would have failed on the ubuntu CI at the next push; the last green run predated them); (c) a MOVED
+  byte-identical file paid a full re-decode+embed although `find_by_hash` (M4) existed for exactly
+  that clone — it had NO caller and `analyze_file`'s docstring claimed a short-circuit that wasn't
+  implemented; (d) the on-open disk reconcile ran synchronously on the Qt main thread.
+- **Root causes:** (a) `prune_missing_problems` still used the parent-dir guard ('parent isdir =>
+  truly deleted') — for a deleted folder the parent IS the folder, so it read as 'volume offline' and
+  kept the row forever, exactly the hole the 2026-06-21 entry documents for the duplicates list.
+  (b) The bare-separator rejection in `_volume_root` (meant for Windows' degenerate `\` anchor that
+  resolves to the current drive) also caught POSIX `/` — but on Windows `/x` normalizes to anchor
+  `\`, so `/` can ONLY mean the real POSIX root; rejecting `\` alone is sufficient and portable.
+- **Resolution:** ONE shared decision core `_missing_on_online_volume` (volume probe + per-file
+  `_real_deletion`) now backs BOTH `prune_missing_files` and `prune_missing_problems` (injectable
+  `exists/isdir/ismount`, deterministic tests for Mode B / offline drive / offline junction on the
+  problems table too). `_volume_root` accepts POSIX `/`. M4 implemented as `record_from_donor`
+  (analyze.py): same sampled hash AND size (the T0 identity standard) AND same feature_version →
+  clone the donor's content-derived features; identity fields (path/mtime/size/probe/hash) come from
+  the fresh CpuFeatures so no stale data survives, and the donor's raw `audio_coverage` is re-read
+  from the DB so NULL ('not yet computed') isn't persisted as a fake 1.0. Wired into `analyze_file`
+  (watcher/serial) and `_gpu_finish`'s serial-decode path (parallel Pass-1) — the pipelined path
+  already decoded, so it doesn't check. UI: `_refresh_with_prune` now paints immediately and runs
+  prune+rebuild in a `_PruneWorker(QThread)` with its OWN store handle (SQLite is per-thread; WAL);
+  the queued `done(n)` refreshes only when something was forgotten; failures are printed, never
+  swallowed. Perf hygiene alongside: `idx_matches_b` (the `a_path=? OR b_path=?` deletes/ads-checks
+  scanned the whole matches table per call), one transaction per prune batch (was one commit per
+  forgotten file), and the freshness contract unified in `analysis_state` (was triplicated across
+  `_needs_analysis` / `pending_files` / `_IngestScheduler._ready`, one drift away from a new
+  scan-vs-watcher bug). UI tests with synthetic '/x' fixtures neutralize BOTH sweeps
+  (`_quiet_reconcile`) — with `/` now a reachable volume on Linux, the background worker would
+  otherwise forget the fixtures mid-test.
+- **Files / refs:** `store.py` (`_missing_on_online_volume`, `_volume_root`, `prune_missing_*`,
+  `forget_file(commit=)`, `find_by_hash(size=)`, `_emb_file`; `iter_problems` removed — use
+  `problems()`); `schema.sql` `idx_matches_b`; `pipeline/analyze.py` (`analysis_state`,
+  `record_from_donor`); `pipeline/fullscan.py` (`_needs_analysis`, `_gpu_finish`); `watch.py`
+  (`pending_files`, `_IngestScheduler._ready`); `match/matcher.py` (dead duration-gate condition);
+  `ui/main.py` (`_PruneWorker`, `_refresh_with_prune`, `_on_prune_done`); tests in
+  `test_perf_opts.py`, `test_store.py`, `test_pipeline.py`, `test_ui.py`.
+- **Scope:** decided 2026-07-06.
+
 ### Files deleted outside the app linger in the duplicates list forever ("I deleted folders, still see them")
 - **Symptom:** the UI keeps showing files/clusters for videos the user deleted in Explorer. Opening or
   refreshing the app does NOT clear them.
@@ -87,6 +130,135 @@ Newest on top. Append-only in spirit. Deep rationale for the design invariants l
   `scripts/profile_pass2.py`; tests `test_align_video.py`, `test_scenes.py`, `test_perf_opts.py`.
 - **Scope:** decided 2026-06-21. NOT yet measured end-to-end (a real multi-hour scan); the per-stage
   microbenchmarks quantify the per-pair win. Block size 256 / gate 2400 chosen by the bench, not tuned.
+
+### Pass-2 "Standard" sits for hours with the CPU at ~0% (the audio-fingerprint pre-pass)
+- **Symptom:** a Standard scan of ~15k files on a spinning HDD showed `Pass 2 (duplicates) · 5614/15005
+  · 3.62s/file · ETA 9h`, the app's CPU at **0.1%**, disk at 0.2 MB/s. Looked frozen / "why is matching
+  so slow and the CPU idle?".
+- **Diagnosis (what it actually was):** NOT the GPU, embeddings, or video align. The UI relabels *every*
+  line containing "Pass 2" to "Pass 2 (duplicates)" (`ui/scan_panel.py:_parse`), so the text hides the
+  sub-stage; the **unit `s/file`** + total = library size is the tell. It was the **audio-fingerprint
+  pre-pass** inside `match_pairs_parallel`: a SERIAL main-process loop running `fpcalc` once per
+  *involved* file. `involved` ≈ the whole library because faiss top-k returns candidates for *every*
+  file, so the "on-demand, most films never pay" intent (matcher comment) degenerated to "all files".
+  CPU ~0% because each `fpcalc` is a subprocess blocked on **HDD seek latency** decoding the audio
+  stream (whole-file for ≤1h content, 600s cap above) — I/O-bound, not compute. 15005 × 3.62s ≈ 15 h
+  for a pre-pass that runs *before* a single pair is compared.
+- **Cost model:** the cost is **extracting** the fingerprint (whole-audio decode off the HDD), not
+  comparing it (`align_audio` is fast FFT; video runs on page-cached embeddings). So "audio-first" is
+  worse; the cheap coarse filter is already video (faiss over one vector/file from Pass-1).
+- **Resolution — LAZY AUDIO (video-first), approved fork:** the fingerprint is now extracted on-demand
+  and ONLY when the video warrants it. Tracing `decide_tree`, audio affects the verdict only in T1/T2,
+  which both require `video.score >= theta_v AND coverage >= min_coverage`. The one exception was T4b's
+  **audio-only OR-branch** (`or audio.score >= theta_a`), the sole tier consulting audio for a
+  video-weak pair — **removed** (with the user's OK, §4). After that, gating audio on
+  `_audio_warranted(v)` = `video.score >= theta_v and video.coverage >= min_coverage` is
+  **verdict-identical** for every other tier (an empty `AlignResult` yields the same tier when video is
+  weak). Unique films and their weak faiss neighbours never decode audio. Workers extract+persist the
+  fp themselves now (WAL serializes the few writes); the serial main-process pre-pass is gone.
+- **Trade-off (the fork):** a pair with matching AUDIO but DIFFERENT video no longer reaches the review
+  queue. Near-empty for a *video* dedup (re-encodes keep the video alignable; cam rips kill the audio),
+  and the strong tiers are untouched → zero-FP guarantee intact (§0). Coverage/"went silent" detection
+  is unaffected (it's the separate sparse `scan_audio_coverage`, not the fingerprint).
+- **Files / refs:** `match/tree.py` (T4b), `match/matcher.py` (`_audio_warranted`,
+  `_audio_if_video_warrants`, `match`, `_pass2_pair`, `name_pair_content_differs`,
+  `match_pairs_parallel` — pre-pass deleted); tests `test_tree.py`
+  (`test_t4b_audio_only_no_longer_reviews`, `test_t1_requires_coverage`), `test_pipeline.py`
+  (`test_lazy_audio_skips_fingerprint_for_video_weak_pairs`), `test_fullscan.py` (the two re-decide
+  threshold tests updated to demote via the video-corroborated T4b).
+
+### Pass-2 looks frozen — bar stuck at 0% for an hour while every core is pegged
+- **Symptom:** a Standard scan sat ~1 h with NO visible progress ("no indicator at all, the user thinks
+  it hung"), yet the scan process had **17 workers, 107 threads, ~9 cores of CPU and 0 MB/s disk** —
+  i.e. genuinely crunching, just invisibly. Pass-2 align phase.
+- **Root cause (two silent gaps in `match_pairs_parallel`):** (1) **Candidate enumeration** — an
+  O(files) serial loop of faiss/duration queries in the MAIN process — emitted NO tqdm line, a
+  multi-minute silent gap. (2) The align bar wrapped an **ORDERED `pool.map(..., chunksize=4)`**: tqdm
+  advances only as results arrive *in submission order*, so a single slow giant pair at the head
+  stalled the bar at 0% while the other W-1 workers had already cleared thousands of pairs — CPU
+  pegged, bar frozen. Removing the old "Pass 2 (audio fp)" pre-pass bar (lazy-audio change) deleted the
+  one intermediate signal that used to move, so the UI was stuck on the last line ("Building coarse
+  index…"). The UI relabels every "Pass 2" line to "Pass 2 (duplicates)", hiding which sub-stage stalls.
+- **Resolution (§2 — never look frozen):** `match_pairs_parallel` is now a **generator** that (1)
+  shows a **"Pass 2 (candidates)"** bar over the enumeration, and (2) drains the pool with a
+  **bounded window** (`_drain_pairs_bounded`): `wait(FIRST_COMPLETED)` advances the bar on EVERY pair
+  that finishes, in any order — a slow giant can no longer stall it. Yielding per-completion also lets
+  `_pass2_parallel` **persist each match incrementally** (`save_match` as rows arrive) instead of only
+  after the whole batch, so a cancel/crash keeps finished work. Completion order ≠ submission order
+  changes only the persist order, idempotent per canonical pair → verdict-invariant (§0).
+- **Bounded submission (RAM):** an early `as_completed(pool.submit(...) for all pairs)` would build a
+  Future per pair — **millions** on a dense library (GBs). `_drain_pairs_bounded` keeps only
+  `4·workers` in flight and refills one slot per completion → memory O(workers), pool never starves.
+- **Worker cap (perf, §1 — measured idle cores):** `_pass2`'s `match_workers` was hard-capped at
+  `min(16, …)`, leaving **14 of 32 cores idle** on this box. Align is CPU-bound with BLAS pinned to 1
+  thread/worker (no oversubscription), so it scales ~linearly → raised to `min(32, cpu-2)` ≈ 30 workers
+  (~1.8× expected: ~1 h → ~35 min). Speed only, verdict unchanged (§0).
+- **Files / refs:** `match/matcher.py` (`match_pairs_parallel` → generator; `_drain_pairs_bounded`);
+  `pipeline/fullscan.py` (`_pass2` worker cap 16→32; `_pass2_parallel` saves incrementally); test
+  `test_pipeline.py::test_drain_pairs_bounded_consumes_all_and_filters_none`.
+
+### Cluster ranking ("Group" step) cost ~5 h, mostly wasted — and Pass-2 re-aligns everything on every run
+- **Symptom:** after the align finished, the scan sat hours in the silent "Group" phase; and a second
+  `Analyze` with nothing changed re-did the whole ~1 h alignment. "Why reprocess if nothing changed?"
+- **Root cause (two):** (1) `rank_cluster` ran **whisper (language) + whole-file audio coverage for
+  EVERY cluster member** — ~17-20 s/member off the HDD (the audio decode, not GPU). Measured: language
+  only flips KEEP in a minority (resolution already dominates per the rank comment), and coverage only
+  matters when copies DIFFER — so most of that work changed no decision. (2) Pass-2 **re-aligned every
+  candidate pair on every run**: `match_pairs_parallel` had no memory of evaluated pairs, and DIFFERENT
+  verdicts aren't persisted (they're ~all of the 2.67M pairs), so there was nothing to skip them by.
+- **Resolution A — lean ranking (Phase 1):** KEEP now scored from **metadata only** (no decode):
+  RESOLUTION >> no-ads >> lower-cam >> **codec-aware effective bitrate** (`_effective_bitrate`:
+  bitrate × codec efficiency, so an AV1/HEVC copy isn't discarded for its lower raw bitrate) − clipping.
+  Audio is reduced to one question — **is the KEEP muted?** — probed lazily DOWN the ranking
+  (`_keep_by_audio`): KEEP the first non-muted copy (escalate past a muted "best"); if none is clean,
+  keep the top and warn only when coverages DIFFER. (`_color_adjusted_keep` won't undo this — it never
+  downgrades KEEP onto a less-clipped copy that has WORSE audio; probes that target's coverage lazily.)
+  Muted-check uses few seek-probes
+  (`_KEEP_COVERAGE_POINTS=12`; 40 was ~28 s on a 44 GB file, ~3 s at 8). **Language is OFF by default**
+  (`rank_cluster(detect_lang=False)`), opt-in for on-demand language-preference KEEP. Measured: ranking
+  ~5 h → ~15-30 min (mostly removing whisper; coverage only on KEEPs).
+- **Resolution B — incremental Pass-2 (evaluated-pairs ledger):** new `evaluated_pairs(pair_hash,
+  fingerprint)` table records EVERY aligned pair (match OR DIFFERENT). `fingerprint` = feature_version +
+  all thresholds (`_scan_fingerprint`) — a change clears the ledger (looser θ can turn a DIFFERENT into
+  a match). On a re-run, `_enumerate_pairs` SKIPS a pair whose hash is in the ledger UNLESS an endpoint
+  is in `changed` (= files Pass-1 re-analyzed this run, `_changed_paths`, captured BEFORE Pass-1). A
+  re-run with nothing changed aligns ZERO pairs (just the cheap enumeration). Recording happens only
+  when the generator fully drains, so a cancelled scan records nothing → never wrongly skips next time.
+- **Forks (approved):** language dropped from default KEEP (on-demand); the muted guard now PROMOTES the
+  next-best copy with audio instead of blanket-reviewing (UI never auto-deletes, so the suggestion is
+  safe; §0 strong tiers untouched). Stale-match pruning for a re-encoded file is a pre-existing gap (a
+  DIFFERENT re-verdict doesn't delete the old `matches` row) — unchanged by this work, noted for later.
+- **Files / refs:** `pipeline/fullscan.py` (`_effective_bitrate`/`_CODEC_EFF`, `_keep_by_audio`,
+  `rank_cluster(detect_lang=…)`, `_score_member`, `_rank_evidence`, `_changed_paths`,
+  `_scan_fingerprint`, `_pass2`/`_pass2_parallel` plumbing); `match/matcher.py` (`_enumerate_pairs`,
+  `_pair_hash`, ledger wiring in `match_pairs_parallel`); `store/store.py`
+  (`evaluated_pairs_load`/`_add`); `store/schema.sql` (`evaluated_pairs`); `pipeline/analyze.py`
+  (`ensure_audio_coverage(n_points=…)`); tests in `test_fullscan.py`/`test_ui.py`/`test_pipeline.py`.
+  Incremental ledger is parallel-path only (small/single-core libraries re-evaluate — cheap there).
+
+### Background analyzer "never finishes" (stuck at 18992/19014) — re-attempts corrupt files every sweep
+- **Symptom:** the tray watcher sat IDLE (0 CPU, no child procs) yet showed `18992/19014`, looking
+  unfinished. The 22 "missing" were the SAME corrupt files (moov atom not found, truncated mp4s) every
+  cycle — "they were already attempted; failing is a result, not pending."
+- **Root cause:** every place that decides what to analyze used only `store.has_fresh(p, st, fv)`
+  (`watch.pending_files`, `watch.Scheduler._ready`, `fullscan._pass1`'s `todo`). A corrupt file gets a
+  LITE record (`exact-only-v1` fv, no embeddings) + a `problems` row, but `has_fresh` is False (fv
+  mismatch + no emb_path), so it counts as "new/changed" → re-decoded EVERY sweep → fails → re-reported
+  → still LITE → forever. Pure waste, and the "processed" count can never reach 100% (those files never
+  get embeddings). §2 said "skip and report", but the report wasn't REMEMBERED across cycles.
+- **Resolution:** the `problems` table now stamps the file's **mtime+size** at failure
+  (`save_problem`), and a new `store.has_unchanged_problem(path, st)` returns True while the file is
+  UNCHANGED. The three work-selection sites skip a file that is fresh OR a known-unchanged problem
+  (`fullscan._needs_analysis`). A re-download / remux changes mtime|size → the guard lifts → it's
+  retried; `--force` always re-attempts. A NULL-mtime row (file gone at failure) never matches.
+- **Migration / self-heal:** existing problem rows have NULL mtime/size (added by the ALTER), so they
+  get re-attempted ONCE more (which stamps them), then are skipped thereafter.
+- **Files / refs:** `store/schema.sql` + `store.py` (`problems.mtime/size`, `save_problem`,
+  `has_unchanged_problem`); `watch.py` (`pending_files`, `_ready`); `pipeline/fullscan.py`
+  (`_needs_analysis`); tests `test_store.py::test_has_unchanged_problem_guards_known_corrupt`,
+  `test_watch.py::test_pending_files_skips_unchanged_corrupt`,
+  `test_fullscan.py::test_needs_analysis_skips_unchanged_corrupt`. Ships in the next build (the running
+  tray watcher is the frozen .exe).
 
 ### Phantom duplicate records: same file under '/' and '\' paths (Windows)
 - **Symptom:** the DB shows the SAME file twice (inflated index, even a file "duplicate" of itself).

@@ -40,8 +40,8 @@ from dupdetect.match.tree import T0_REASON
 from dupdetect.quality.color import CLIP_DOWNGRADE_MARGIN, GRADE_DIVERGENCE
 from dupdetect.quality.language import detect_language
 from dupdetect.pipeline.analyze import (
-    analyze_file, build_record, ensure_audio_coverage, extract_cpu_features, extract_gpu_features,
-    feature_version, maybe_emit_viz,
+    analysis_state, analyze_file, build_record, ensure_audio_coverage, extract_cpu_features,
+    extract_gpu_features, feature_version, maybe_emit_viz, record_from_donor,
 )
 from dupdetect.store import FingerprintStore
 
@@ -135,6 +135,13 @@ def _cpu_worker(args):
     return extract_cpu_features(path, independent_scenes=independent_scenes)
 
 
+def _needs_analysis(store: FingerprintStore, p: str, fv: str, force: bool) -> bool:
+    """A file needs (re)analysis unless the shared freshness contract (analysis_state — same rule the
+    watcher applies) says it's 'done' (fresh, or already-failed and unchanged). `force` overrides.
+    Unstattable ('gone') -> analyze anyway, so analyze_file surfaces the real error."""
+    return force or analysis_state(store, p, fv) in ("gone", "pending")
+
+
 def _pass1(paths: list[str], store: FingerprintStore, embedder: Embedder,
            th: Thresholds, fv: str, force: bool, workers: int,
            independent_scenes: bool, progress: bool = False,
@@ -146,7 +153,7 @@ def _pass1(paths: list[str], store: FingerprintStore, embedder: Embedder,
           Only beneficial on SSD/NVMe; on HDD disk concurrency causes thrashing (use 1).
     Incremental: skips already-fresh files. RESILIENT: an unreadable file (corrupt,
     missing moov atom, etc.) is SKIPPED and reported; does not abort the scan. Returns [(path, error)]."""
-    todo = [p for p in paths if force or not store.has_fresh(p, os.stat(p), fv)]
+    todo = [p for p in paths if _needs_analysis(store, p, fv, force)]
     skipped: list[tuple[str, str]] = []
     fresh = len(paths) - len(todo)
     if not todo:
@@ -182,6 +189,12 @@ def _gpu_finish(cpu, frames_times, store, embedder, th, fv, independent_scenes) 
     """Embed (GPU, main) + build_record + save. `frames_times`=(frames,ts) already decoded
     (pipelined path) or None to decode here (serial path)."""
     if frames_times is None:
+        # M4: before paying the decode, a byte-identical file already indexed (a MOVE/copy) donates
+        # its features. Only on this serial-decode path — the pipelined path already decoded.
+        donor = record_from_donor(cpu, store, fv)
+        if donor is not None:
+            store.save(donor, feature_version=fv)
+            return
         emb, times, color = extract_gpu_features(cpu.path, cpu.probe, embedder, th)
     else:
         frames, times, color = frames_times
@@ -276,6 +289,11 @@ def full_scan(targets, store: FingerprintStore, embedder: Embedder,
         paths, excluded_by_height = filter_by_height(paths, max_height, workers)
     fv = feature_version(embedder, independent_scenes,
                          audio_fp_cap_s=th.audio_fp_cap_s, audio_fp_cap_above_s=th.audio_fp_cap_above_s)
+    # Incremental Pass-2: the set of files Pass-1 will (re)analyze — their content moved, so their
+    # candidate pairs must be re-aligned even if the ledger has them. Captured BEFORE _pass1 (after it
+    # runs they're all 'fresh' again). Empty on a no-change re-run -> Pass-2 skips every prior pair.
+    # Only needed when we'll actually match (skip the has_fresh sweep on a Pass-1-only re-index).
+    changed = _changed_paths(paths, store, fv, force) if match else set()
     skipped = _pass1(paths, store, embedder, th, fv, force, workers, independent_scenes,
                      progress, decode_workers=decode_workers)
     if eager_coverage:                             # Deep: whole-file coverage for ALL (incremental)
@@ -294,10 +312,15 @@ def full_scan(targets, store: FingerprintStore, embedder: Embedder,
     index.build(all_paths, gvecs, window_owners=w_owners, window_vecs=wvecs)
 
     # --- Pass 2: match (persists pairs) + review/editions queue ---
-    review, editions = _pass2(paths, store, index, th, progress)
+    # Incremental ledger: skip re-aligning pairs already evaluated under this fingerprint (fv + θ),
+    # except those touching a file re-analyzed this run (`changed`). A no-change re-run aligns nothing.
+    fingerprint = _scan_fingerprint(fv, th)
+    evaluated = store.evaluated_pairs_load(fingerprint)
+    review, editions = _pass2(paths, store, index, th, progress,
+                              evaluated=evaluated, changed=changed, fingerprint=fingerprint)
 
     _apply_name_grouping(store, th)                # name copies (N) -> NAME_COPY (probable)
-    clusters_out = _rebuild_clusters(store, th)
+    clusters_out = _rebuild_clusters(store, th, progress=progress)
     return {"clusters": clusters_out, "review_queue": review, "editions": editions,
             "skipped": skipped, "excluded_by_height": excluded_by_height}
 
@@ -314,15 +337,47 @@ def _ensure_coverage_all(paths, store, progress) -> None:
             ensure_audio_coverage(p, store, rec.probe.duration_s, bool(rec.probe.audio_tracks))
 
 
-def _pass2(paths, store, index, th, progress):
+def _changed_paths(paths, store: FingerprintStore, fv: str, force: bool) -> set:
+    """Files Pass-1 will (re)analyze = those NOT already fresh (or all, when force). Their content may
+    have moved, so the incremental Pass-2 must NOT skip their candidate pairs. Cheap: one stat() +
+    indexed lookup per file (MFT-cached). Unstattable -> treated as changed (safe: re-evaluate)."""
+    if force:
+        return set(paths)
+    changed = set()
+    for p in paths:
+        try:
+            if not store.has_fresh(p, os.stat(p), fv):
+                changed.add(p)
+        except OSError:
+            changed.add(p)
+    return changed
+
+
+def _scan_fingerprint(fv: str, th: Thresholds) -> str:
+    """Identity of 'how Pass-2 would decide a pair': the feature_version (embedding/audio algorithm)
+    plus ALL thresholds. Any change here can flip a verdict (e.g. looser θ turns a DIFFERENT into a
+    match), so it keys the evaluated-pairs ledger -> a change invalidates every cached evaluation."""
+    raw = json.dumps(th.raw, sort_keys=True, default=str)
+    return hashlib.blake2b(("%s\x00%s" % (fv, raw)).encode("utf-8", "surrogatepass"),
+                           digest_size=16).hexdigest()
+
+
+def _pass2(paths, store, index, th, progress, evaluated=None, changed=None, fingerprint=None):
     """Pass-2 dispatcher. Parallel over candidate pairs when multiple cores are available
     (Pass-2 is compute-bound: banded video DP ~89%), else the sequential match() loop.
-    Results are deterministic per pair -> verdict invariant (§0). Returns (review, editions)."""
-    match_workers = min(16, max(1, (os.cpu_count() or 4) - 2))
+    Results are deterministic per pair -> verdict invariant (§0). Returns (review, editions).
+    `evaluated`/`changed`/`fingerprint` drive the incremental ledger (parallel path only)."""
+    # Pass-2 align is CPU-bound (banded DP) with each worker's BLAS pinned to 1 thread, so it scales
+    # ~linearly with cores. Use cpu-2 (leave 2 for the main collector + OS), capped at 32 to keep the
+    # process count sane on very large boxes. (Was hard-capped at 16, which left half of a 32-core
+    # machine idle.) Speed only -> verdict unchanged (§0).
+    match_workers = min(32, max(1, (os.cpu_count() or 4) - 2))
     if match_workers > 1 and len(paths) >= 8:      # parallel only when it outweighs pool overhead
-        return _pass2_parallel(paths, store, index, th, match_workers, progress)
+        return _pass2_parallel(paths, store, index, th, match_workers, progress,
+                               evaluated=evaluated, changed=changed, fingerprint=fingerprint)
     # Sequential matcher: lazy + LRU-bounded resident cache -> loads only the films actually
-    # compared (never preloads the whole library, which could OOM the GPU on a large DB).
+    # compared (never preloads the whole library, which could OOM the GPU on a large DB). The
+    # incremental ledger is parallel-only; small/single-core libraries re-evaluate (cheap at that size).
     cache = EmbeddingCache(store, max_items=1500)
     return _pass2_sequential(paths, store, index, th, cache, progress)
 
@@ -350,14 +405,16 @@ def _both_on_disk(a: str, b: str, seen: dict[str, bool]) -> bool:
     return _on_disk(a, seen) and _on_disk(b, seen)
 
 
-def _pass2_parallel(paths, store, index, th, workers, progress):
+def _pass2_parallel(paths, store, index, th, workers, progress,
+                    evaluated=None, changed=None, fingerprint=None):
     review: list = []
     editions: list = []
     ondisk: dict[str, bool] = {}                   # §0 concurrent-deletion guard memo
     if progress:
         tqdm.write(f"Pass 2: matching candidate pairs on {workers} workers…")
     for a, b, vval, conf, reason, ad_off, aj, vj, sj in match_pairs_parallel(
-            paths, store, index, th, workers, progress=progress):
+            paths, store, index, th, workers, progress=progress,
+            evaluated=evaluated, changed=changed, fingerprint=fingerprint):
         if not _both_on_disk(a, b, ondisk):        # a copy was trashed mid-scan -> don't resurrect it
             continue
         store.save_match(a, b, vval, conf, reason, ad_offset_s=ad_off,
@@ -448,7 +505,8 @@ def _stable_cluster_id(members: list[str]) -> int:
     return int.from_bytes(hashlib.blake2b(key, digest_size=7).digest(), "big")
 
 
-def _rebuild_clusters(store: FingerprintStore, th: Thresholds, reuse: Optional[dict] = None) -> list[dict]:
+def _rebuild_clusters(store: FingerprintStore, th: Thresholds, reuse: Optional[dict] = None,
+                      progress: bool = False) -> list[dict]:
     """A5: clusters = derived view of the GLOBAL `matches` graph (not the yields of this run).
     Rebuilds the full table ATOMICALLY (one transaction via store.replace_clusters) with STABLE,
     content-derived cluster ids -> a concurrent rebuild can neither interleave rows nor reuse an id
@@ -465,9 +523,12 @@ def _rebuild_clusters(store: FingerprintStore, th: Thresholds, reuse: Optional[d
         if verdict in _DUPLICATE_VALUES:
             uf.union(a, b)
     rows, clusters_out = [], []
-    for members in uf.groups().values():
-        if len(members) <= 1:
-            continue
+    # Ranking each group runs the DEFERRED whisper + audio coverage per member -> a long, formerly
+    # SILENT phase ("Group" step). Show it (§2: never look frozen); the clusters table is written
+    # once at the end (atomic), so without this bar the UI sat blank for the whole ranking.
+    groups = [m for m in uf.groups().values() if len(m) > 1]
+    for members in tqdm(groups, desc="Pass 2 (grouping + best copy)", unit="group",
+                        disable=not progress, dynamic_ncols=True):
         cid = _stable_cluster_id(members)
         cached = reuse.get(frozenset(members))
         if cached is not None:                     # membership unchanged -> reuse ranking (no whisper/audio)
@@ -645,16 +706,31 @@ def _color_diverges(scored) -> bool:
                for i in range(len(cs)) for j in range(i + 1, len(cs)))
 
 
+def _whisper_device() -> str:
+    """GPU for the deferred language detection when one is present, else CPU. Unlike Pass-1's
+    language pass (which ran in forked CPU workers that must NOT touch CUDA), this runs in
+    rank_cluster on the MAIN process, so CUDA is safe here — and measured ~10x faster on the
+    fingerprint inference (CPU 7.0s -> GPU 0.7s per file on an RTX 5090). Speed only: the detected
+    language is model-determined, not device-determined, and it only steers KEEP, never the verdict
+    (§0). Falls back to CPU on the CPU-only flavor (no CUDA) or if torch is unavailable."""
+    try:
+        import torch
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:                                   # noqa: BLE001 — no torch -> CPU
+        return "cpu"
+
+
 def _ensure_lang(rec, store: FingerprintStore, th: Thresholds) -> None:
     """DEFERRED language detection: whisper runs here (cluster ranking) instead of in Pass-1,
     since lang_detected is consumed ONLY for KEEP selection within a cluster (it never enters the
     decision tree). Most unique files are never clustered -> never pay for whisper. Computed once
     and persisted -> identical output, far less work at scale. A failure -> None (rank falls back
-    to resolution, as before)."""
+    to resolution, as before). Runs on the GPU when available (see _whisper_device)."""
     if rec.quality.lang_detected:
         return
     try:
-        lang = detect_language(rec.path, model=th.raw["quality"]["whisper_model"])
+        lang = detect_language(rec.path, model=th.raw["quality"]["whisper_model"],
+                               device=_whisper_device())
     except Exception:                                   # noqa: BLE001
         lang = None
     rec.quality.lang_detected = lang
@@ -662,87 +738,142 @@ def _ensure_lang(rec, store: FingerprintStore, th: Thresholds) -> None:
         store.set_lang(rec.path, lang)
 
 
-def _score_member(m: str, store: FingerprintStore, th: Thresholds, wanted: set, cluster: set):
-    """Score ONE cluster member by QUALITY (not identity): wanted language >> RESOLUTION >> no ads
-    >> lower cam >> higher bitrate, minus clipping. Returns (score, m, rec, lang_ok, pixels, br,
-    has_ads). Deferred whisper + on-demand audio coverage are ensured here (only members pay for it),
-    mutating the loaded rec so the audio/keep logic reads the real value."""
+# Codec efficiency = quality-per-bit relative to H.264 (=1.0). Modern codecs (AV1/HEVC/VP9) reach the
+# same visual quality at far lower bitrate, so RAW bitrate under-rates them; multiplying compares copies
+# fairly (an AV1 at 3 Mbps ≈ an H.264 at 6). Steers KEEP only — never the verdict (§0).
+_CODEC_EFF = {
+    "av1": 2.0, "av01": 2.0, "hevc": 1.7, "h265": 1.7, "hev1": 1.7, "hvc1": 1.7,
+    "vp9": 1.6, "vp09": 1.6, "h264": 1.0, "avc": 1.0, "avc1": 1.0, "vp8": 0.9,
+    "mpeg4": 0.7, "msmpeg4v3": 0.7, "xvid": 0.7, "divx": 0.7, "vc1": 0.7, "wmv3": 0.7,
+    "mpeg2video": 0.5, "mpeg2": 0.5, "mpeg1video": 0.4,
+}
+# Muted-check granularity for the KEEP candidate: spotting a silent/muted copy needs far fewer seek
+# probes than precise coverage (each probe is an HDD seek). Deep's coverage-for-all keeps the default 40.
+_KEEP_COVERAGE_POINTS = 12
+
+
+def _effective_bitrate(codec: str | None, bitrate_kbps: int | None) -> float:
+    """Bitrate scaled by codec efficiency -> a codec-fair quality proxy. Unknown codec -> H.264 (1.0)."""
+    return (bitrate_kbps or 0) * _CODEC_EFF.get((codec or "").lower().strip(), 1.0)
+
+
+def _score_member(m: str, store: FingerprintStore, th: Thresholds, cluster: set,
+                  wanted: set, detect_lang: bool):
+    """Score ONE cluster member by QUALITY from METADATA ONLY (no decode): RESOLUTION >> no ads
+    >> lower cam >> codec-aware bitrate, minus clipping. Language is scored ONLY when `detect_lang`
+    (opt-in: runs whisper) — OFF by default, since resolution dominates KEEP on real data and whisper is
+    expensive; the muted-audio question is handled separately by the KEEP muted-check (_keep_by_audio),
+    NOT per member. Returns (score, m, rec, has_ads, lang_ok)."""
     rec = store.load(m, with_embeddings=False)
-    _ensure_lang(rec, store, th)                   # deferred whisper: only cluster members need it
-    rec.quality.audio_coverage = ensure_audio_coverage(
-        m, store, rec.probe.duration_s, bool(rec.probe.audio_tracks))
+    lang_ok = False
+    if detect_lang:                                # opt-in whisper (on-demand language-preference KEEP)
+        _ensure_lang(rec, store, th)
+        lang_ok = rec.quality.lang_detected in wanted
     pixels = (rec.probe.width or 0) * (rec.probe.height or 0)
-    br = rec.probe.bitrate_kbps or 0
-    lang_ok = rec.quality.lang_detected in wanted
     has_ads = _cluster_has_ads(store, m, cluster, th)
     score = (
-        (1_000_000_000 if lang_ok else 0)          # wanted language: dominant
+        (1_000_000_000 if lang_ok else 0)          # wanted language: dominant — ONLY when opted in
         + pixels                                   # resolution: robust, dominates the rest
         - (500_000 if has_ads else 0)              # ads: penalize (removable)
         - rec.quality.cam_score * 100_000          # cam: weak signal
         - th.color_clip_keep_weight * rec.quality.color.clip   # clipping: destroyed detail
-        #                                          # -> prefer the least-clipped copy (the original)
-        + br                                       # bitrate: fine tiebreak
+        + _effective_bitrate(rec.probe.vcodec, rec.probe.bitrate_kbps)   # codec-aware fine tiebreak
     )
-    return (score, m, rec, lang_ok, pixels, br, has_ads)
+    return (score, m, rec, has_ads, lang_ok)
 
 
-def _color_adjusted_keep(keep, scored):
+def _color_adjusted_keep(keep, scored, covs, store):
     """Color divergence (a copy was re-graded, e.g. a bad auto color-correct): the quality score can
     pick a higher-res re-grade that CLIPPED detail (crushed blacks). When the grade diverges, prefer
-    the LEAST-CLIPPED copy (the preserved/original look) — but ONLY when the score-winner clips
+    the LEAST-CLIPPED copy (the preserved/original look) — but ONLY when the CURRENT keep clips
     SIGNIFICANTLY more, so a trivial clip edge never downgrades a real resolution upgrade (a 1080p
     @0% clip must not beat a genuine 4K @1% clip; measured: original ~1% vs bad re-grade ~26% ->
-    CLIP_DOWNGRADE_MARGIN). No-op when keep is None (audio guard already sent it to review)."""
+    CLIP_DOWNGRADE_MARGIN). No-op when keep is None.
+
+    Won't undo the muted-check: it never downgrades onto a copy that has WORSE audio than the current
+    keep (keep has audio, the less-clipped target is muted). The target's coverage is probed lazily
+    here (cached) — only when a downgrade would otherwise fire, which is rare. Compares the chosen
+    keep's clip (the muted-check may have escalated keep away from scored[0])."""
     if keep is None or not _color_diverges(scored):
         return keep
     least = min(scored, key=lambda t: t[2].quality.color.clip)
-    if scored[0][2].quality.color.clip - least[2].quality.color.clip > CLIP_DOWNGRADE_MARGIN:
-        return least[1]
-    return keep
+    keep_clip = next((t[2].quality.color.clip for t in scored if t[1] == keep), None)
+    if keep_clip is None or keep_clip - least[2].quality.color.clip <= CLIP_DOWNGRADE_MARGIN:
+        return keep
+    keep_cov = covs.get(keep, 0.0)                  # keep was always probed by _keep_by_audio
+    least_cov = covs.get(least[1])
+    if least_cov is None:                           # not on keep's escalation path -> probe it now
+        least_cov = ensure_audio_coverage(least[1], store, least[2].probe.duration_s,
+                                          bool(least[2].probe.audio_tracks), n_points=_KEEP_COVERAGE_POINTS)
+    if keep_cov >= AUDIO_OK_COVERAGE and least_cov < AUDIO_OK_COVERAGE:
+        return keep                                 # downgrade would LOSE audio -> keep the clean copy
+    return least[1]
 
 
-def _rank_evidence(scored, keep) -> dict:
-    """Human-readable per-member evidence (KEEP/discard/review + lang/res/bitrate/cam/ads/audio)."""
+def _rank_evidence(scored, keep, covs: dict) -> dict:
+    """Human-readable per-member evidence (KEEP/discard/review + res/codec/bitrate/cam/ads/audio).
+    Audio note only for copies actually probed (covs); language only if detected (opt-in)."""
     def role(m: str) -> str:
         if m == keep:
             return "KEEP"
         return "review" if keep is None else "discard"
     return {
-        m: "%s: lang=%s%s, %dx%d, %dkbps, cam=%.2f%s%s" % (
-            role(m),
-            rec.quality.lang_detected or "?", " (wanted)" if lang_ok else "",
-            rec.probe.width or 0, rec.probe.height or 0, br, rec.quality.cam_score,
+        m: "%s: %dx%d, %s %dkbps, cam=%.2f%s%s%s" % (
+            role(m), rec.probe.width or 0, rec.probe.height or 0,
+            rec.probe.vcodec or "?", rec.probe.bitrate_kbps or 0, rec.quality.cam_score,
             ", ads" if has_ads else "",
-            _audio_note(rec.quality.audio_coverage, rec.probe.duration_s))
-        for _, m, rec, lang_ok, _, br, has_ads in scored
+            (", lang=%s%s" % (rec.quality.lang_detected, " (wanted)" if lang_ok else ""))
+            if rec.quality.lang_detected else "",
+            _audio_note(covs[m], rec.probe.duration_s) if m in covs else "")
+        for _s, m, rec, has_ads, lang_ok in scored
     }
 
 
-def rank_cluster(members: list[str], store: FingerprintStore, th: Thresholds) -> dict:
+def _keep_by_audio(scored, store: FingerprintStore):
+    """Pick KEEP by audio, probing coverage lazily DOWN the quality ranking (the escalation): KEEP the
+    first copy whose audio is NOT muted, so a muted 'best' copy yields to a slightly lower one that
+    actually has audio. The kept copy is clean -> no warning.
+
+    If NO copy is clean, keep the top-scored one and warn ONLY when the coverages DIFFER (one copy is
+    truly worse — genuine ambiguity -> review). When every copy shares ~the same coverage (same source,
+    or all with no audio track) audio is not a differentiator -> auto-keep, NO warning (else obvious
+    dups would hide in Review). Never returns None: the cluster always gets a suggested KEEP, and the
+    warning routes the muted-ambiguous ones to review (§0: the UI never auto-deletes). Only the copies
+    actually inspected get a probe (cheap, cached, _KEEP_COVERAGE_POINTS). Returns (keep, warning, covs)."""
+    covs: dict = {}
+    for _s, m, rec, *_ in scored:
+        cov = ensure_audio_coverage(m, store, rec.probe.duration_s,
+                                    bool(rec.probe.audio_tracks), n_points=_KEEP_COVERAGE_POINTS)
+        covs[m] = cov
+        rec.quality.audio_coverage = cov
+        if cov >= AUDIO_OK_COVERAGE:
+            return m, False, covs                  # first clean copy down the ranking wins (escalation)
+    # no clean copy: keep the best-scored; warn only if coverages genuinely DIFFER (not same-source).
+    vals = list(covs.values())
+    differ = bool(vals) and (max(vals) - min(vals)) > AUDIO_COV_TOL
+    return scored[0][1], differ, covs
+
+
+def rank_cluster(members: list[str], store: FingerprintStore, th: Thresholds,
+                 detect_lang: bool = False) -> dict:
     """Ranks members by QUALITY (not identity) and marks the 'keep'.
 
-    Priority (highest to lowest weight): wanted language >> RESOLUTION >> no ads
-    >> lower cam >> higher bitrate. Resolution dominates among the robust signals because
-    language and cam proved unreliable on real data (see quality/camrip.py).
-    Returns {keep, discard, evidence}.
+    KEEP = highest RESOLUTION, then codec-aware bitrate (an AV1/HEVC copy is NOT penalised for its
+    lower raw bitrate), minus ads/cam/clipping — all from METADATA (no decode). Audio is reduced to its
+    one decisive question for the KEEP: is it muted? (see _keep_by_audio — escalates to the next-best
+    non-muted copy). Language is OFF by default (whisper is expensive and resolution dominates KEEP on
+    real data); `detect_lang=True` opts in (on-demand language-preference KEEP). Returns
+    {keep, discard, evidence, audio_warning}.
     """
-    wanted = set(th.raw["quality"]["wanted_langs"])
+    wanted = set(th.raw["quality"]["wanted_langs"]) if detect_lang else set()
     cluster = set(members)
-    scored = [_score_member(m, store, th, wanted, cluster) for m in members]
-    # Final tiebreak: SHORTEST PATH. Among equivalent copies keep the original
-    # ('movie.avi' over 'movie (1).avi') and prefer the shortest-path location.
+    scored = [_score_member(m, store, th, cluster, wanted, detect_lang) for m in members]
+    # Final tiebreak: SHORTEST PATH (keep 'movie.avi' over 'movie (1).avi').
     scored.sort(key=lambda t: (t[0], -len(t[1])), reverse=True)
-    # Audio guard: block auto-KEEP ONLY when a copy has truncated audio AND the copies DIFFER in
-    # coverage (one copy really has better audio) -> review, so we never blindly keep the muted one.
-    # If every copy shares ~the same coverage (same source, even if truncated), audio is not a
-    # differentiator -> auto-pick by the quality score (avoids hiding obvious dups in Review).
-    covs = [rec.quality.audio_coverage for _s, _m, rec, *_ in scored]
-    audio_bad = any(c < AUDIO_OK_COVERAGE for c in covs) and (max(covs) - min(covs)) > AUDIO_COV_TOL
-    keep = None if audio_bad else scored[0][1]
-    keep = _color_adjusted_keep(keep, scored)      # re-grade clipped detail -> prefer the original look
+    keep, audio_warning, covs = _keep_by_audio(scored, store)
+    keep = _color_adjusted_keep(keep, scored, covs, store)   # re-grade clip -> original, but keep audio
     return {"keep": keep, "discard": [m for _, m, *_ in scored if m != keep],
-            "evidence": _rank_evidence(scored, keep), "audio_warning": audio_bad}
+            "evidence": _rank_evidence(scored, keep, covs), "audio_warning": audio_warning}
 
 
 def _audio_note(cov: float, duration_s: float) -> str:

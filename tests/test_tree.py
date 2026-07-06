@@ -95,12 +95,25 @@ def test_high_video_score_but_negligible_coverage_does_not_align(th):
 
 
 def test_t1_requires_coverage(th):
-    # strong audio + high video score but negligible coverage -> NOT T1 (certain dup);
-    # falls to T4b via strong audio (review), never CERTAIN with a 4% match.
+    # strong audio + high video score but negligible coverage -> NOT T1 (certain dup): the video
+    # path is a spurious 4% cherry-pick, and the coverage gate blocks T4b's video branch too. With
+    # the audio-only T4b branch removed (lazy audio), this now lands in DIFFERENT, never CERTAIN.
     a, b = _rec("a", "x"), _rec("b", "y")
     r = decide_tree(a, b, AlignResult(0.9), AlignResult(0.9, coverage=0.04),
                     AlignResult(0.2), th)
     assert r.verdict != Verdict.CERTAIN
+    assert r.verdict == Verdict.DIFFERENT
+
+
+def test_t4b_audio_only_no_longer_reviews(th):
+    # LAZY AUDIO (§1, approved fork): a pair with matching AUDIO but WEAK video (below theta_v) and
+    # weak scenes used to reach T4b via the audio-only OR-branch -> PROBABLE (review). That branch
+    # was removed so the audio fingerprint is never extracted for video-weak pairs; the verdict is
+    # now DIFFERENT. The strong tiers (T1/T2) are untouched -> zero-FP guarantee intact (§0).
+    a, b = _rec("a", "x"), _rec("b", "y")
+    r = decide_tree(a, b, AlignResult(0.95), AlignResult(0.2, coverage=0.2),
+                    AlignResult(0.2), th)
+    assert r.verdict == Verdict.DIFFERENT
 
 
 def test_t5_different_files(th):

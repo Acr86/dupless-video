@@ -99,14 +99,25 @@ def decide_tree(
         )
 
     # ---- T4b: A4 — close the dead zone ---------------------------------
-    # Strong signal from ONE modality without corroboration -> review ("when in doubt,
-    # to the queue"). Video requires coverage: otherwise a spurious short path (cov 0.04)
-    # between different films would send false positives to the queue. (Audio auto-gated.)
-    if (video.score >= th.theta_v and video.coverage >= th.min_coverage) or audio.score >= th.theta_a:
+    # Strong VIDEO without corroboration -> review ("when in doubt, to the queue"). Video requires
+    # coverage: otherwise a spurious short path (cov 0.04) between different films would send false
+    # positives to the queue.
+    #
+    # LAZY AUDIO (perf, §1): the historical audio-only OR-branch (`or audio.score >= th.theta_a`)
+    # was REMOVED. It was the only tier that consulted audio for a video-WEAK pair, which forced
+    # extracting the whole-file audio fingerprint (the Pass-2 bottleneck: ~3.6s/file off an HDD) for
+    # EVERY candidate file, even the unique movies whose faiss neighbours are weak video matches.
+    # With it gone, audio can affect the verdict ONLY when `video.score >= theta_v AND coverage >=
+    # min_coverage` (T1/T2), so the matcher computes the fingerprint exactly there and skips it for
+    # the rest -> "most unique files never pay for it" (the original on-demand intent), restored at
+    # full-library scale. Trade-off (a fork, approved): a pair with matching AUDIO but DIFFERENT
+    # video no longer reaches the review queue. Physically near-empty for a VIDEO dedup (re-encodes
+    # keep the video alignable; cam rips kill the audio), and it never weakened a strong tier (§0:
+    # T1/T2 zero-FP guarantee untouched). See matcher.match / _pass2_pair for the gate.
+    if video.score >= th.theta_v and video.coverage >= th.min_coverage:
         return make(
             Verdict.PROBABLE, 0.55,
-            f"T4b strong signal uncorroborated (v={video.score:.2f}/cov{video.coverage:.2f},"
-            f"a={audio.score:.2f}) => review",
+            f"T4b uncorroborated video (v={video.score:.2f}/cov{video.coverage:.2f}) => review",
         )
 
     # ---- T5: no alignment ----------------------------------------------

@@ -9,6 +9,7 @@ C3: the align offset (pre-roll ads) is propagated here, it is a pair-level prope
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import os
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict
@@ -49,9 +50,7 @@ def candidate_paths(rec: Record, store: FingerprintStore, index: CoarseIndex,
     # globally near (>=0.962 measured), so the gate prunes the dragnet without losing them. Only
     # this net is gated; top-k/window retrieval above are untouched.
     dur = duration_blocking(rec, store, th)
-    if rec.global_vec is not None and getattr(rec.global_vec, "size", 0):
-        dur = index.gate_by_global(rec.global_vec, dur, th.duration_block_cos_gate)
-    cands |= dur
+    cands |= index.gate_by_global(rec.global_vec, dur, th.duration_block_cos_gate)
     cands.discard(rec.path)
     return cands
 
@@ -121,6 +120,28 @@ def _ensure_audio_fp(rec: Record, store: FingerprintStore, th: Thresholds) -> np
     return fp
 
 
+def _audio_warranted(v: AlignResult, th: Thresholds) -> bool:
+    """LAZY AUDIO gate (§1): does the video alignment reach the zone where the audio score can still
+    change the verdict? Only T1 (audio corroborates) and T2 (audio does NOT align => different dub)
+    consult audio, and both require `video.score >= theta_v AND coverage >= min_coverage`. Below
+    that, no tier reads audio (the audio-only T4b branch was removed, see tree.decide_tree), so the
+    fingerprint — the most expensive step (whole-file audio decode) — is skipped with an IDENTICAL
+    verdict. Deterministic from the (cached) video align: same input -> same gate (§0)."""
+    return v.score >= th.theta_v and v.coverage >= th.min_coverage
+
+
+def _audio_if_video_warrants(rec: Record, other: Record, v: AlignResult,
+                             store: FingerprintStore, th: Thresholds) -> AlignResult:
+    """Align the two audio fingerprints ONLY when the video warrants it (see _audio_warranted),
+    extracting them on-demand. Otherwise return an empty AlignResult (audio cannot affect the
+    verdict here) -> the whole-file audio decode is never paid for video-weak pairs."""
+    if not _audio_warranted(v, th):
+        return AlignResult(0.0)
+    fa = _ensure_audio_fp(rec, store, th)
+    fb = _ensure_audio_fp(other, store, th)
+    return align_audio(fa, fb, min_overlap_s=th.raw["audio"]["min_overlap_s"])
+
+
 def match(rec: Record, store: FingerprintStore, index: CoarseIndex,
           th: Thresholds, cache: EmbeddingCache | None = None,
           seen: set[tuple[str, str]] | None = None) -> list[Result]:
@@ -143,13 +164,16 @@ def match(rec: Record, store: FingerprintStore, index: CoarseIndex,
         if other is None:
             continue
 
-        # three independent signals. A1: embeddings from the resident cache.
-        # Audio fingerprint computed ON-DEMAND here (only for candidate pairs).
-        fa = _ensure_audio_fp(rec, store, th)
-        fb = _ensure_audio_fp(other, store, th)
-        a = align_audio(fa, fb, min_overlap_s=th.raw["audio"]["min_overlap_s"])
+        # LAZY AUDIO (perf, §1): video + scenes run first — both are CHEAP (embeddings are the
+        # resident cache / page-cached .npy, scene cuts are in the DB; no disk read). The audio
+        # fingerprint is the single most expensive step (decodes the whole audio off disk), so it is
+        # extracted ON-DEMAND only when the video is strong enough that audio can change the verdict
+        # (the T1/T2 zone: video.score >= theta_v AND coverage >= min_coverage). Outside that zone no
+        # tier consults audio (the audio-only T4b branch was removed), so an empty AlignResult yields
+        # the IDENTICAL verdict — see decide_tree T4b. Unique films never pay for the fingerprint.
         v = _align_video_pair(rec, other, cache, th)
         s = align_scenes(rec.scene_cuts, other.scene_cuts, theta=th.theta_s)
+        a = _audio_if_video_warrants(rec, other, v, store, th)
 
         res = decide_tree(rec, other, a, v, s, th)
         results.append(res)
@@ -241,17 +265,22 @@ def name_pair_content_differs(a_path: str, b_path: str, store: FingerprintStore,
         return True                                # LITE: can't verify content -> don't group
     cdict = {ra.path: np.ascontiguousarray(ra.embeddings, dtype=np.float32),
              rb.path: np.ascontiguousarray(rb.embeddings, dtype=np.float32)}
-    a = align_audio(_ensure_audio_fp(ra, store, th), _ensure_audio_fp(rb, store, th),
-                    min_overlap_s=th.raw["audio"]["min_overlap_s"])
     v = _align_video_pair(ra, rb, _DictCache(cdict), th)
     s = align_scenes(ra.scene_cuts, rb.scene_cuts, theta=th.theta_s)
+    a = _audio_if_video_warrants(ra, rb, v, store, th)   # lazy: audio only in the T1/T2 zone
     return decide_tree(ra, rb, a, v, s, th).verdict == Verdict.DIFFERENT
 
 
 def _pass2_pair(pair: tuple[str, str]):
-    """Worker: aligns ONE candidate pair (pure CPU compute) and decides. Returns the row to
-    persist, or None for DIFFERENT (mirrors match()'s filter). Audio fps were ensured+persisted
-    in the main process, so here they load from the row (no fpcalc in workers)."""
+    """Worker: aligns ONE candidate pair and decides. Returns the row to persist, or None for
+    DIFFERENT (mirrors match()'s filter).
+
+    LAZY AUDIO (§1): video + scenes run first (CHEAP — embeddings/scene cuts, no disk read). The
+    whole-file audio fingerprint is extracted+persisted ON-DEMAND, and only when the video warrants
+    it (the T1/T2 zone). Most candidate pairs are weak video matches (a unique film's faiss
+    neighbours) decided by video alone -> they never decode audio. The fingerprint is cached in the
+    DB (set_audio_fp), so a file shared by several real-dup pairs is fingerprinted once; concurrent
+    writes are serialized by WAL (busy_timeout). Verdict identical to the eager path (§0)."""
     a_path, b_path = pair
     store, th = _PW["store"], _PW["th"]
     ra = _load_safe(store, a_path)
@@ -265,9 +294,9 @@ def _pass2_pair(pair: tuple[str, str]):
         e = r.embeddings
         cdict[r.path] = (np.ascontiguousarray(e, dtype=np.float32)
                          if e is not None and e.size else np.empty((0, 0), dtype=np.float32))
-    a = align_audio(ra.audio_fp, rb.audio_fp, min_overlap_s=th.raw["audio"]["min_overlap_s"])
     v = _align_video_pair(ra, rb, _DictCache(cdict), th)
     s = align_scenes(ra.scene_cuts, rb.scene_cuts, theta=th.theta_s)
+    a = _audio_if_video_warrants(ra, rb, v, store, th)   # on-demand, only in the T1/T2 zone
     res = decide_tree(ra, rb, a, v, s, th)
     if res.verdict == Verdict.DIFFERENT:
         return None
@@ -275,39 +304,110 @@ def _pass2_pair(pair: tuple[str, str]):
             (v.offset if v else None), asdict(a), asdict(v), asdict(s))
 
 
-def match_pairs_parallel(paths, store: FingerprintStore, index: CoarseIndex,
-                         th: Thresholds, workers: int, progress: bool = False) -> list:
-    """Parallel Pass-2: enumerate unique candidate pairs, ensure audio fps once (main, cheap),
-    then align+decide each pair across a process pool. Returns rows = the tuple from `_pass2_pair`
-    for non-DIFFERENT pairs. Same results as the sequential match() loop, just parallel."""
+def _enumerate_pairs(paths, store: FingerprintStore, index: CoarseIndex, th: Thresholds,
+                     evaluated: set, changed: set, progress: bool) -> list:
+    """Unique candidate-pair list for Pass-2. Skips pairs already aligned under the current fingerprint
+    whose endpoints did NOT change this run (incremental). Shows a bar — enumeration is O(files) faiss/
+    duration queries in the MAIN process, otherwise a silent multi-minute gap before the first pair (§2)."""
     from tqdm import tqdm
     pairs: set[tuple[str, str]] = set()
-    for p in paths:
+    for p in tqdm(paths, desc="Pass 2 (candidates)", unit="file",
+                  disable=not progress, dynamic_ncols=True):
         rec = store.load(p, with_embeddings=False)
         if rec is None:
             continue
         for cand in candidate_paths(rec, store, index, th):
-            pairs.add(canonical_pair(p, cand))
-    pair_list = list(pairs)
+            pr = canonical_pair(p, cand)
+            if (evaluated and pr[0] not in changed and pr[1] not in changed
+                    and _pair_hash(pr) in evaluated):
+                continue                               # already aligned, unchanged -> skip (incremental)
+            pairs.add(pr)
+    return list(pairs)
+
+
+def match_pairs_parallel(paths, store: FingerprintStore, index: CoarseIndex,
+                         th: Thresholds, workers: int, progress: bool = False,
+                         evaluated: set | None = None, changed: set | None = None,
+                         fingerprint: str | None = None):
+    """Parallel Pass-2: enumerate unique candidate pairs, then align+decide each across a process
+    pool. A GENERATOR — YIELDS each non-DIFFERENT row (the `_pass2_pair` tuple) AS its pair finishes,
+    so the caller persists incrementally (a cancel/crash keeps what's done) instead of waiting for
+    the whole batch. Same results as the sequential match() loop, just parallel.
+
+    PROGRESS (§2 — never look frozen): two visible phases. (1) Candidate enumeration is O(files)
+    faiss/duration queries in the MAIN process — a multi-minute SILENT gap before the first pair
+    unless it shows a bar. (2) Alignment uses `as_completed`, NOT the ordered `pool.map`: the bar
+    advances on EVERY pair that finishes, in ANY order. With the ordered map a single slow giant pair
+    at the head stalled the whole bar to 0% while the other W-1 workers had already cleared thousands
+    of pairs (CPU pegged, bar frozen — looked hung). Completion order ≠ submission order only changes
+    the persist order, which is idempotent per canonical pair (§0 verdict-invariant).
+
+    LAZY AUDIO (§1): there is NO eager whole-library audio-fingerprint pass any more. It used to run
+    here, serially in the main process, fpcalc'ing EVERY involved file (= the whole library, since
+    faiss top-k makes every file a candidate) before a single pair was compared — the measured
+    Pass-2 bottleneck (~3.6s/file off an HDD, hours of serial disk reads). Each worker now extracts
+    the fingerprint on-demand and ONLY for pairs whose video warrants it (see _pass2_pair /
+    _audio_warranted), so unique films never decode their audio. Fingerprints are persisted, so a
+    later run reuses them.
+
+    INCREMENTAL (§1): `evaluated` = pair-hashes already aligned in a PRIOR scan under the SAME
+    `fingerprint` (feature_version + θ). Such a pair is SKIPPED — its result is already persisted (a
+    row in `matches`, or a DIFFERENT that needs none) — UNLESS an endpoint is in `changed` (re-analyzed
+    this run, so its content moved and the pair must re-align). Every pair actually aligned is recorded
+    back, so the NEXT run skips it. A re-run with nothing changed aligns ZERO pairs (just enumeration)."""
+    pair_list = _enumerate_pairs(paths, store, index, th,
+                                 evaluated or set(), changed or set(), progress)
     if not pair_list:
-        return []
-    # Ensure (compute+persist) the on-demand fingerprint once per involved file, in the MAIN
-    # process -> workers stay read-only and never run fpcalc concurrently.
-    involved = {x for pr in pair_list for x in pr}
-    for fp_path in tqdm(involved, desc="Pass 2 (audio fp)", unit="file",
-                        disable=not progress, dynamic_ncols=True):
-        rec = store.load(fp_path, with_embeddings=False)
-        if rec is not None:
-            _ensure_audio_fp(rec, store, th)
-    rows = []
+        return
+    aligned: list[str] = []
     # single_threaded_blas: pin each worker's BLAS to 1 thread BEFORE the pool spawns, so W processes
     # don't oversubscribe the cores with W*cores matmul threads (perf, §1; verdict unchanged, §0).
     with single_threaded_blas(), ProcessPoolExecutor(
             max_workers=workers, initializer=_pass2_init,
             initargs=(str(store.db_path), th)) as pool:
-        for row in tqdm(pool.map(_pass2_pair, pair_list, chunksize=4), total=len(pair_list),
-                        desc="Pass 2 (align pairs)", unit="pair",
-                        disable=not progress, dynamic_ncols=True):
+        for pr, row in _drain_pairs_bounded(pool, pair_list, workers, progress):
+            aligned.append(_pair_hash(pr))             # record EVERY aligned pair (match OR different)
             if row is not None:
-                rows.append(row)
-    return rows
+                yield row
+    if fingerprint is not None:
+        store.evaluated_pairs_add(aligned, fingerprint)
+
+
+def _pair_hash(pair: tuple[str, str]) -> str:
+    """Stable 128-bit hash of a CANONICAL pair (a<=b) -> the evaluated-pairs ledger key (compact: a
+    full library is millions of pairs, so storing paths twice would be far heavier)."""
+    return hashlib.blake2b("\x00".join(pair).encode("utf-8", "surrogatepass"),
+                           digest_size=16).hexdigest()
+
+
+def _drain_pairs_bounded(pool, pair_list, workers: int, progress: bool):
+    """Align `pair_list` on `pool`, yielding (pair, row) for EVERY pair AS it finishes (row is None for
+    DIFFERENT). The caller filters None and records the pair in the ledger.
+
+    BOUNDED submission: a dense library yields MILLIONS of pairs; submitting them all at once builds
+    millions of Futures (GBs of RAM). Keep only ~4*workers in flight and refill one slot per completion
+    -> memory O(workers), the pool never starves. wait(FIRST_COMPLETED) advances the bar on EVERY finish
+    (any order), so one slow giant pair can't stall it (§2). Completion order is idempotent per pair (§0)."""
+    from concurrent.futures import FIRST_COMPLETED, wait
+    from tqdm import tqdm
+    it = iter(pair_list)
+    inflight: dict = {}                                # future -> pair
+    for _ in range(max(1, workers) * 4):               # prime the window
+        pr = next(it, None)
+        if pr is None:
+            break
+        inflight[pool.submit(_pass2_pair, pr)] = pr
+    bar = tqdm(total=len(pair_list), desc="Pass 2 (align pairs)", unit="pair",
+               disable=not progress, dynamic_ncols=True)
+    try:
+        while inflight:
+            done, _ = wait(list(inflight), return_when=FIRST_COMPLETED)
+            for fut in done:
+                pr = inflight.pop(fut)
+                bar.update(1)
+                yield pr, fut.result()
+                nxt = next(it, None)                   # refill one slot per completion
+                if nxt is not None:
+                    inflight[pool.submit(_pass2_pair, nxt)] = nxt
+    finally:
+        bar.close()

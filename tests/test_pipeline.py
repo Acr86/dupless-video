@@ -97,6 +97,51 @@ def test_match_detects_dup_and_filters_different(env):
     assert res[0].video.offset == 45.0          # C3: offset travels in the Result
 
 
+def test_lazy_audio_skips_fingerprint_for_video_weak_pairs(env, monkeypatch):
+    """LAZY AUDIO (§1): audio is aligned ONLY when the video warrants it (T1/T2 zone). match(A)
+    sees B (strong video -> audio consulted) and C (weak video -> audio MUST be skipped), so
+    align_audio is called exactly once. This is what spares unique films the whole-file audio
+    decode (the Pass-2 bottleneck). Verdicts are unchanged (see test_match_detects_dup...)."""
+    store, th, cache = env
+    calls: list = []
+    real_fake = matcher.align_audio                       # the env stub
+
+    def counting_audio(fa, fb, **k):
+        calls.append((int(fa[0]), int(fb[0])))
+        return real_fake(fa, fb, **k)
+    monkeypatch.setattr(matcher, "align_audio", counting_audio)
+
+    a = store.load("/A.mkv", with_embeddings=False)
+    res = matcher.match(a, store, index=None, th=th, cache=cache)
+    assert [r.candidate_path for r in res] == ["/B.mkv"]  # verdict unchanged
+    assert calls == [(0, 1)]                              # only the strong A,B pair; A,C skipped
+
+
+def test_drain_pairs_bounded_consumes_all_and_filters_none(monkeypatch):
+    """The bounded-window pool drain (§2 progress + O(workers) memory): every pair is submitted and
+    consumed even when the window (4*workers) is smaller than the pair count, and None results
+    (DIFFERENT) are filtered out — mirroring the eager list path. Uses a synchronous fake pool so the
+    logic is tested without real multiprocessing."""
+    from concurrent.futures import Future
+
+    from dupdetect.match import matcher
+
+    class _FakePool:                                      # runs the task inline, returns a done Future
+        def submit(self, fn, arg):
+            f = Future(); f.set_result(fn(arg)); return f
+
+    # stub the worker: "skip" pairs -> None (DIFFERENT), the rest echo the pair as a row
+    monkeypatch.setattr(matcher, "_pass2_pair",
+                        lambda pr: None if pr[0] == "skip" else ("row", pr))
+    pairs = [(f"a{i}", f"b{i}") for i in range(10)] + [("skip", "x"), ("skip", "y")]
+    out = list(matcher._drain_pairs_bounded(_FakePool(), pairs, workers=2, progress=False))
+    # yields (pair, row) for EVERY pair (row None for "skip"); the caller filters/records.
+    assert len(out) == 12                                 # all 12 pairs reported
+    assert {pr for pr, _row in out} == set(pairs)         # all consumed, any order
+    rows = [pr for pr, row in out if row is not None]
+    assert set(rows) == {(f"a{i}", f"b{i}") for i in range(10)}   # 10 real, 2 "skip" -> None
+
+
 def test_shared_seen_prevents_double_evaluation(env):
     """C2: with a shared `seen` set, pair (A,B) is evaluated in match(A) and NOT
     re-evaluated in match(B). Without sharing, match(B) would return A."""
@@ -298,3 +343,98 @@ def test_build_record_flags_unembeddable_file():
     # the guard is the first statement -> times/color/embedder are irrelevant for this case
     with _pytest.raises(RuntimeError, match="no decodable"):
         build_record(cpu, np.zeros((0, 768), np.float16), None, None, None, load_thresholds())
+
+
+# --------------------------------------------------------------- M4: byte-identical donor clone
+def _donor_rec(path: str) -> Record:
+    """Full Record with embeddings — the donor a moved/copied byte-identical file clones from."""
+    return Record(
+        path=path, mtime=1.0, size=4096,
+        probe=Probe(duration_s=100.0, width=1920, height=1080, vcodec="h264",
+                    bitrate_kbps=5000, audio_tracks=[]),
+        content_hash="deadbeef",
+        global_vec=np.ones(8, np.float32),
+        window_vecs=np.ones((2, 8), np.float32),
+        embeddings=np.ones((3, 8), np.float16),
+        audio_fp=np.array([1, 2], np.uint32),
+        scene_cuts=np.array([1.0], np.float32),
+        frame_times=np.array([0.0, 1.0, 2.0], np.float32),
+        quality=Quality(),
+    )
+
+
+class _StubEmbedder:
+    """Only `feature_version` is consulted on the M4 clone path (no decode/embed happens)."""
+    feature_version = "stub|v1"
+
+
+def _fv(th):
+    from dupdetect.pipeline import analyze
+    return analyze.feature_version(_StubEmbedder(), False, audio_fp_cap_s=th.audio_fp_cap_s,
+                                   audio_fp_cap_above_s=th.audio_fp_cap_above_s)
+
+
+def test_analyze_file_clones_byte_identical_donor(tmp_path, monkeypatch):
+    """M4: a moved/copied byte-identical file (same sampled hash AND size, same feature_version)
+    donates its features — the expensive decode+embed is SKIPPED. Identity fields (path/mtime/size)
+    are FRESH (no stale data survives the clone), and a donor audio_coverage that was never computed
+    (NULL) stays NULL — load() folds NULL->1.0, which must not be persisted as if measured (it could
+    mask a muted copy in the KEEP check)."""
+    from dupdetect.pipeline import analyze
+    store = FingerprintStore(tmp_path / "m4.sqlite")
+    th = load_thresholds()
+    fv = _fv(th)
+    donor = _donor_rec("/lib/orig.mkv")
+    store.save(donor, feature_version=fv)
+    store.conn.execute("UPDATE files SET audio_coverage=NULL WHERE path=?", (donor.path,))
+    store.conn.commit()
+
+    moved = tmp_path / "moved.mkv"
+    moved.write_bytes(b"x")                                # analyze_file stats it; never decoded
+    st = moved.stat()
+
+    def fake_cpu(path, independent_scenes=False):
+        return analyze.CpuFeatures(
+            path=str(moved), mtime=st.st_mtime, size=donor.size,
+            probe=donor.probe, content_hash=donor.content_hash,
+            audio_fp=np.empty(0, np.uint32), scene_cuts=np.empty(0, np.float32),
+            lang_detected=None, cam_score_partial=0.0, audio_coverage=None)
+
+    monkeypatch.setattr(analyze, "extract_cpu_features", fake_cpu)
+    monkeypatch.setattr(analyze, "extract_gpu_features",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("decode must be skipped")))
+    rec = analyze.analyze_file(str(moved), store, _StubEmbedder(), th)
+    assert rec.path == str(moved) and rec.mtime == st.st_mtime and rec.size == donor.size
+    row = store.conn.execute("SELECT size, audio_coverage FROM files WHERE path=?",
+                             (str(moved),)).fetchone()
+    assert row is not None and row["size"] == donor.size
+    assert row["audio_coverage"] is None                   # NULL preserved (not faked to 1.0)
+    got = store.load(str(moved), with_embeddings=True)     # the clone got its own .npy
+    assert np.allclose(got.embeddings.astype(np.float32), donor.embeddings.astype(np.float32))
+    store.close()
+
+
+def test_record_from_donor_requires_size_and_embeddings(tmp_path):
+    """The hash is SAMPLED (head|mid|tail): a same-hash DIFFERENT-size candidate must NOT donate
+    (equal size is the T0 identity standard, §0). A LITE donor (no embeddings) can't donate either."""
+    from dupdetect.pipeline import analyze
+    store = FingerprintStore(tmp_path / "m4b.sqlite")
+    th = load_thresholds()
+    fv = _fv(th)
+    donor = _donor_rec("/lib/orig.mkv")
+    store.save(donor, feature_version=fv)
+
+    def cpu(size):
+        return analyze.CpuFeatures(
+            path="/lib/copy.mkv", mtime=2.0, size=size, probe=donor.probe,
+            content_hash=donor.content_hash, audio_fp=np.empty(0, np.uint32),
+            scene_cuts=np.empty(0, np.float32), lang_detected=None,
+            cam_score_partial=0.0, audio_coverage=None)
+
+    assert analyze.record_from_donor(cpu(donor.size), store, fv) is not None
+    assert analyze.record_from_donor(cpu(donor.size + 1), store, fv) is None   # size mismatch
+    # LITE donor: wipe the embeddings pointer -> can't donate
+    store.conn.execute("UPDATE files SET emb_path=NULL WHERE path=?", (donor.path,))
+    store.conn.commit()
+    assert analyze.record_from_donor(cpu(donor.size), store, fv) is None
+    store.close()

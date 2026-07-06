@@ -25,7 +25,7 @@ from typing import Callable, Optional
 from dupdetect.config import Thresholds
 from dupdetect.features.embeddings import Embedder
 from dupdetect.match.retrieval import CoarseIndex
-from dupdetect.pipeline.analyze import analyze_file, feature_version
+from dupdetect.pipeline.analyze import analysis_state, analyze_file, feature_version
 from dupdetect.pipeline.fullscan import (
     _apply_name_grouping,
     _pass2,
@@ -83,21 +83,12 @@ def _as_list(targets) -> list[str]:
 
 def pending_files(targets, store: FingerprintStore, fv: str, recursive: bool = True,
                   stable_s: float = DEFAULT_STABLE_S, now: float | None = None) -> list[str]:
-    """On-disk videos that are NEW or CHANGED vs the store AND stable. A file modified within the
-    last `stable_s` seconds is skipped (still being copied) -> picked up once it settles. `now`
-    injectable for tests."""
+    """On-disk videos that are NEW or CHANGED vs the store AND stable ('pending' under the shared
+    freshness contract, analysis_state — gone/mid-copy/fresh/known-failed are all skipped; a mid-copy
+    file is picked up once it settles). `now` injectable for tests."""
     now = time.time() if now is None else now
-    out: list[str] = []
-    for p in collect_videos(targets, recursive=recursive):
-        try:
-            st = os.stat(p)
-        except OSError:
-            continue                               # vanished between listing and stat -> skip
-        if now - st.st_mtime < stable_s:           # still being written -> wait a cycle
-            continue
-        if not store.has_fresh(p, st, fv):         # new or changed (mtime/size/feature_version)
-            out.append(p)
-    return out
+    return [p for p in collect_videos(targets, recursive=recursive)
+            if analysis_state(store, p, fv, stable_s=stable_s, now=now) == "pending"]
 
 
 def _norm(path: str) -> str:
@@ -285,17 +276,11 @@ class _IngestScheduler:
 
     @staticmethod
     def _ready(p: str, store: FingerprintStore, fv: str, stable_s: float, now: float):
-        """(ready, keep) — re-validate a candidate at point of use (shared by both lanes so they can't
-        disagree): vanished -> drop; mid-copy -> keep-but-not-ready (re-queue); already fresh -> drop."""
-        try:
-            st = os.stat(p)
-        except OSError:
-            return False, False
-        if now - st.st_mtime < stable_s:
-            return False, True
-        if store.has_fresh(p, st, fv):
-            return False, False
-        return True, True
+        """(ready, keep) — re-validate a candidate at point of use via the shared freshness contract
+        (analysis_state, same rule as pending_files and the full scan): 'gone'/'done' -> drop;
+        'copying' -> keep-but-not-ready (re-queue); 'pending' -> ready."""
+        state = analysis_state(store, p, fv, stable_s=stable_s, now=now)
+        return state == "pending", state in ("pending", "copying")
 
     def next_chunk(self, ctx: WatchContext, fv: str, tuning: WatchTuning, now: float) -> list[str]:
         """Up to `chunk` paths to analyze this cycle: FAST lane (newest-first) first, then OLDEST

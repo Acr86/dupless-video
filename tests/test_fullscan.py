@@ -17,10 +17,10 @@ from dupdetect.store import FingerprintStore, canonical_pair
 FV = "test|v1"
 
 
-def _rec(path, w=1920, h=1080, br=8000, lang="eng", cam=0.1) -> Record:
+def _rec(path, w=1920, h=1080, br=8000, lang="eng", cam=0.1, codec="h264") -> Record:
     return Record(
         path=path, mtime=0.0, size=100,
-        probe=Probe(duration_s=6000.0, width=w, height=h, vcodec="h264",
+        probe=Probe(duration_s=6000.0, width=w, height=h, vcodec=codec,
                     bitrate_kbps=br, audio_tracks=[]),
         content_hash="h" + path,
         global_vec=np.zeros(8, np.float32), window_vecs=np.zeros((4, 8), np.float32),
@@ -62,12 +62,22 @@ def test_rank_prefers_higher_resolution(th, store):
     assert set(out["discard"]) == {"/720.mkv", "/480.mkv"}
 
 
-def test_rank_wanted_lang_beats_resolution(th, store):
-    # 4K in Russian (unwanted) vs 1080p in Spanish (wanted) -> Spanish wins
+def test_rank_wanted_lang_beats_resolution_when_opted_in(th, store):
+    # Language KEEP is OPT-IN now (whisper is expensive; resolution dominates by default). With
+    # detect_lang=True the wanted language still dominates: 1080p Spanish beats 4K Russian.
+    store.save(_rec("/4k_ru.mkv", 3840, 2160, lang="rus"), feature_version=FV)
+    store.save(_rec("/1080_es.mkv", 1920, 1080, lang="spa"), feature_version=FV)
+    out = rank_cluster(["/4k_ru.mkv", "/1080_es.mkv"], store, th, detect_lang=True)
+    assert out["keep"] == "/1080_es.mkv"
+
+
+def test_rank_ignores_language_by_default(th, store):
+    # Default (detect_lang=False): language is NOT consulted -> the 4K copy wins on resolution even
+    # though the 1080p is in the wanted language. (Phase-1 lean ranking; language is on-demand.)
     store.save(_rec("/4k_ru.mkv", 3840, 2160, lang="rus"), feature_version=FV)
     store.save(_rec("/1080_es.mkv", 1920, 1080, lang="spa"), feature_version=FV)
     out = rank_cluster(["/4k_ru.mkv", "/1080_es.mkv"], store, th)
-    assert out["keep"] == "/1080_es.mkv"
+    assert out["keep"] == "/4k_ru.mkv"
 
 
 def test_rank_bitrate_breaks_tie_at_same_resolution(th, store):
@@ -75,6 +85,15 @@ def test_rank_bitrate_breaks_tie_at_same_resolution(th, store):
     store.save(_rec("/lo.mkv", 1920, 1080, br=3000), feature_version=FV)
     out = rank_cluster(["/hi.mkv", "/lo.mkv"], store, th)
     assert out["keep"] == "/hi.mkv"
+
+
+def test_rank_codec_aware_bitrate_keeps_efficient_av1(th, store):
+    # Same resolution: an AV1 at 3000 kbps vs H.264 at 5000 kbps. Raw bitrate would keep the H.264,
+    # but AV1 reaches the same quality at ~half the bitrate -> effective 6000 > 5000 -> KEEP the AV1.
+    store.save(_rec("/av1.mkv", br=3000, codec="av1"), feature_version=FV)
+    store.save(_rec("/h264.mkv", br=5000, codec="h264"), feature_version=FV)
+    out = rank_cluster(["/av1.mkv", "/h264.mkv"], store, th)
+    assert out["keep"] == "/av1.mkv"
 
 
 def test_cluster_has_ads_reads_canonical_offset(th, store):
@@ -111,6 +130,94 @@ def test_cluster_has_midroll_ads_via_interleaved_ratio(th, store):
     out = rank_cluster(["/clean.mkv", "/withads.mkv"], store, th)
     assert out["keep"] == "/clean.mkv"                       # KEEP the copy WITHOUT commercials
     assert ", ads" in out["evidence"]["/withads.mkv"]        # UI marks which copy has ads
+
+
+# ---------------------------------------------- incremental Pass-2 (evaluated-pairs ledger)
+
+def test_needs_analysis_skips_unchanged_corrupt(tmp_path):
+    """Pass-1 must not re-decode a known-corrupt file that didn't change (it would fail again and sit
+    'unprocessed' forever). Skipped while unchanged; retried after force or a content change."""
+    import os
+
+    from dupdetect.pipeline.fullscan import _needs_analysis
+    from dupdetect.store import FingerprintStore
+    s = FingerprintStore(tmp_path / "n.sqlite")
+    f = tmp_path / "bad.mp4"; f.write_bytes(b"x" * 50)
+    assert _needs_analysis(s, str(f), "fv1", False) is True       # unseen -> analyze
+    s.save_problem(str(f), "moov atom not found", "corrupt")
+    assert _needs_analysis(s, str(f), "fv1", False) is False      # known corrupt, unchanged -> skip
+    assert _needs_analysis(s, str(f), "fv1", True) is True        # force overrides
+    f.write_bytes(b"x" * 99)                                      # re-downloaded
+    assert _needs_analysis(s, str(f), "fv1", False) is True       # changed -> retry
+    s.close()
+
+
+def test_scan_fingerprint_changes_with_fv_and_thresholds(th):
+    import copy
+
+    from dupdetect.config import Thresholds
+    from dupdetect.pipeline.fullscan import _scan_fingerprint
+    base = _scan_fingerprint("fv1", th)
+    assert _scan_fingerprint("fv1", th) == base                  # stable: same inputs -> same key
+    assert _scan_fingerprint("fv2", th) != base                  # algorithm change -> invalidates
+    raw = copy.deepcopy(th.raw); raw["video"]["theta_v"] = 0.999
+    assert _scan_fingerprint("fv1", Thresholds(raw=raw)) != base  # θ change -> invalidates (looser θ
+    #                                                              # could turn a DIFFERENT into a match)
+
+
+def test_evaluated_pairs_ledger_roundtrip_and_invalidation(store):
+    store.evaluated_pairs_add(["aa", "bb", "cc"], "fp1")
+    assert store.evaluated_pairs_load("fp1") == {"aa", "bb", "cc"}
+    # loading under a DIFFERENT fingerprint sees nothing AND prunes the now-stale rows
+    assert store.evaluated_pairs_load("fp2") == set()
+    assert store.evaluated_pairs_load("fp1") == set()            # fp1 rows were pruned
+
+
+def test_enumerate_pairs_skips_evaluated_unless_changed(th, store, monkeypatch):
+    from dupdetect.match import matcher
+    from dupdetect.match.matcher import _enumerate_pairs, _pair_hash
+    from dupdetect.store.store import canonical_pair
+    for p in ("/a.mkv", "/b.mkv", "/c.mkv"):
+        store.save(_rec(p), feature_version=FV)
+    cand = {"/a.mkv": {"/b.mkv", "/c.mkv"}}                       # candidate graph: a~b, a~c
+    monkeypatch.setattr(matcher, "candidate_paths", lambda rec, s, i, t: cand.get(rec.path, set()))
+    paths = ["/a.mkv", "/b.mkv", "/c.mkv"]
+    ab, ac = canonical_pair("/a.mkv", "/b.mkv"), canonical_pair("/a.mkv", "/c.mkv")
+
+    # run 1: nothing evaluated -> all pairs enumerated
+    pairs1 = _enumerate_pairs(paths, store, None, th, set(), set(), progress=False)
+    assert set(pairs1) == {ab, ac}
+    evaluated = {_pair_hash(pr) for pr in pairs1}
+
+    # run 2: all evaluated, nothing changed -> ZERO pairs (the incremental win)
+    assert _enumerate_pairs(paths, store, None, th, evaluated, set(), progress=False) == []
+
+    # run 2b: /c re-analyzed -> only pairs TOUCHING /c are re-enumerated
+    pairs2 = _enumerate_pairs(paths, store, None, th, evaluated, {"/c.mkv"}, progress=False)
+    assert set(pairs2) == {ac}
+
+
+def test_match_pairs_parallel_records_every_aligned_pair(th, store, monkeypatch):
+    """The ledger records EVERY aligned pair (match OR DIFFERENT), so the next run can skip it. Stubs
+    the pool/drain so no real multiprocessing runs; the pair here decides DIFFERENT (row None) yet is
+    still recorded."""
+    import contextlib
+
+    from dupdetect.match import matcher
+    from dupdetect.store.store import canonical_pair
+    for p in ("/a.mkv", "/b.mkv"):
+        store.save(_rec(p), feature_version=FV)
+    monkeypatch.setattr(matcher, "candidate_paths",
+                        lambda rec, s, i, t: {"/b.mkv"} if rec.path == "/a.mkv" else set())
+    monkeypatch.setattr(matcher, "single_threaded_blas", contextlib.nullcontext)
+    monkeypatch.setattr(matcher, "ProcessPoolExecutor", lambda **k: contextlib.nullcontext())
+    # drain yields (pair, None) for each pair -> DIFFERENT, nothing to save, but still "aligned"
+    monkeypatch.setattr(matcher, "_drain_pairs_bounded",
+                        lambda pool, pl, w, pr: iter([(x, None) for x in pl]))
+    rows = list(matcher.match_pairs_parallel(["/a.mkv", "/b.mkv"], store, None, th,
+                                             workers=2, progress=False, fingerprint="fp1"))
+    assert rows == []                                            # DIFFERENT -> no rows yielded
+    assert store.evaluated_pairs_load("fp1") == {matcher._pair_hash(canonical_pair("/a.mkv", "/b.mkv"))}
 
 
 # ---------------------------------------------- clusters = derived view (does not accumulate)
@@ -274,15 +381,30 @@ def test_apply_thresholds_to_store_redecides_from_stored_signals(th, store):
     assert rep0["changed"] == 0 and _verdict("/a.mkv") == "CERTAIN"
     assert rep0["skipped_no_signals"] >= 1                          # the NAME_COPY row
 
-    # tighten the video threshold so the pair no longer clears T1 -> drops to review
+    # tighten the AUDIO threshold above the stored audio score (0.85) so the pair no longer clears
+    # T1, but the video still corroborates (0.80 >= theta_v, cov 0.90) -> demotes to T4b review.
+    # (With lazy audio the audio-only review path is gone, so demotion to PROBABLE now requires the
+    # surviving video-corroborated T4b branch.)
     tight_raw = copy.deepcopy(th.raw)
-    tight_raw["video"]["theta_v"] = 0.95
+    tight_raw["audio"]["theta_a"] = 0.90
     tight = Thresholds(raw=tight_raw)
     rep = apply_thresholds_to_store(store, tight)
     assert rep["changed"] == 1
     assert rep["transitions"].get("CERTAIN->PROBABLE") == 1
     assert _verdict("/a.mkv") == "PROBABLE"
     assert _verdict("/n1.mkv") == "NAME_COPY"                       # signal-less row untouched
+
+    # counter-check (new semantics): tightening VIDEO below the stored score now drops a pair with
+    # no scene corroboration straight to DIFFERENT — the audio-only T4b review path was removed.
+    store.save_match(
+        "/a.mkv", "/b.mkv", "CERTAIN", 0.99, "T1 placeholder",      # reset the row to CERTAIN
+        audio_json=_json.dumps({"score": 0.85}),
+        video_json=_json.dumps({"score": 0.80, "coverage": 0.90, "contiguous_superset": False}),
+        scenes_json=_json.dumps({"score": 0.0}))
+    tv_raw = copy.deepcopy(th.raw)
+    tv_raw["video"]["theta_v"] = 0.95
+    apply_thresholds_to_store(store, Thresholds(raw=tv_raw))
+    assert _verdict("/a.mkv") == "DIFFERENT"
 
 
 def test_apply_thresholds_action_reapplies_to_store(store, tmp_path):
@@ -306,10 +428,13 @@ def test_apply_thresholds_action_reapplies_to_store(store, tmp_path):
 
     cfg = tmp_path / "th.yaml"
     shutil.copyfile(effective_config_path(), cfg)                   # an existing config to base on
-    out = actions.apply_thresholds(0.95, 0.80, config_path=str(cfg), store=store)
+    # Raise theta_a above the stored audio (0.85) while keeping theta_v below the video (0.80): T1
+    # no longer clears but the video still corroborates -> T4b review. (Lazy audio removed the
+    # audio-only review path, so demotion to PROBABLE goes through the video-corroborated T4b.)
+    out = actions.apply_thresholds(0.78, 0.90, config_path=str(cfg), store=store)
 
     assert out == str(cfg)
-    assert yaml.safe_load(cfg.read_text(encoding="utf-8"))["video"]["theta_v"] == pytest.approx(0.95)
+    assert yaml.safe_load(cfg.read_text(encoding="utf-8"))["video"]["theta_v"] == pytest.approx(0.78)
     v = store.conn.execute("SELECT verdict FROM matches WHERE a_path='/a.mkv'").fetchone()[0]
     assert v == "PROBABLE"                                          # T1 no longer clears -> review
 
@@ -330,7 +455,7 @@ def test_full_scan_skips_corrupt_file(th, store, tmp_path):
     assert "corrupt.mp4" in report["skipped"][0][0]
     assert report["clusters"] == []
     # the problem is PERSISTED in the DB with its error (for index reconstruction)
-    probs = store.iter_problems()
+    probs = store.problems()
     assert len(probs) == 1 and "corrupt.mp4" in probs[0][0]
     assert probs[0][1]                                   # error message is present
 

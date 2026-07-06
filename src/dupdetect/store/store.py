@@ -69,6 +69,12 @@ class FingerprintStore:
             self.conn.execute("ALTER TABLE problems ADD COLUMN repair_note TEXT")
         except sqlite3.OperationalError:
             pass                                   # already exists
+        # Same for `problems.mtime`/`size` (skip re-attempting a known-corrupt file that didn't change).
+        for _col, _type in (("mtime", "REAL"), ("size", "INTEGER")):
+            try:
+                self.conn.execute(f"ALTER TABLE problems ADD COLUMN {_col} {_type}")
+            except sqlite3.OperationalError:
+                pass                               # already exists
         # Same for `files.audio_coverage` (audio coverage; NULL in old records -> 1.0).
         try:
             self.conn.execute("ALTER TABLE files ADD COLUMN audio_coverage REAL")
@@ -99,6 +105,12 @@ class FingerprintStore:
         if changed:
             self.conn.commit()
 
+    def _emb_file(self, ep: str) -> Path:
+        """Resolve a stored `emb_path` to the on-disk `.npy`: a plain filename lives in `emb_dir`
+        (current records), a legacy absolute path is used as-is. ONE rule for has_fresh /
+        _row_to_record / forget_file — they must never disagree on where the embeddings are."""
+        return Path(ep) if os.path.isabs(ep) else self.emb_dir / ep
+
     # ---- incrementalidad -------------------------------------------------
     def has_fresh(self, path: str, st: os.stat_result, feature_version: str) -> bool:
         """True if there is a record for `path` with matching mtime, size AND feature_version.
@@ -120,8 +132,7 @@ class FingerprintStore:
         ep = row["emb_path"]
         if not ep:
             return False
-        emb_file = Path(ep) if os.path.isabs(ep) else self.emb_dir / ep
-        return emb_file.exists()
+        return self._emb_file(ep).exists()
 
     def content_hash_if_unchanged(self, path: str, st: os.stat_result) -> Optional[str]:
         """Stored content_hash if the file has NOT changed (same mtime+size), regardless of
@@ -214,20 +225,35 @@ class FingerprintStore:
     def save_problem(self, path: str, error: str, category: str | None = None) -> None:
         """Records a file that failed analysis. `category`: 'corrupt' (data lost
         -> delete/external tool) | 'reindex' (valid but missing index/slow seek -> a
-        remux -c copy fixes it). If not given, inferred from the error message."""
+        remux -c copy fixes it). If not given, inferred from the error message.
+        Stamps the file's mtime+size so a later scan/sweep can SKIP it while unchanged
+        (see has_unchanged_problem) instead of re-decoding a known-corrupt file every cycle."""
         cat = category or classify_problem(error)
+        try:
+            st = os.stat(path)
+            mtime, size = st.st_mtime, st.st_size
+        except OSError:                            # file vanished -> no stamp (will retry if it reappears)
+            mtime, size = None, None
         self.conn.execute(
-            """INSERT INTO problems (path, error, category, last_seen) VALUES (?,?,?,?)
+            """INSERT INTO problems (path, error, category, mtime, size, last_seen) VALUES (?,?,?,?,?,?)
                ON CONFLICT(path) DO UPDATE SET
-                   error=excluded.error, category=excluded.category, last_seen=excluded.last_seen""",
-            (str(path), error, cat, time.time()),
+                   error=excluded.error, category=excluded.category,
+                   mtime=excluded.mtime, size=excluded.size, last_seen=excluded.last_seen""",
+            (str(path), error, cat, mtime, size, time.time()),
         )
         self.conn.commit()
 
-    def iter_problems(self) -> list[tuple[str, str]]:
-        """(path, error) for ALL problems. Stable signature; use problems() for the category."""
-        return [(r["path"], r["error"]) for r in
-                self.conn.execute("SELECT path, error FROM problems ORDER BY path")]
+    def has_unchanged_problem(self, path: str, st: os.stat_result) -> bool:
+        """True if `path` already FAILED analysis and has NOT changed since (same mtime+size). Such a
+        file was already attempted, so skip it: a corrupt file would just fail again, wasting a decode
+        every sweep, and it would also never let the 'processed' count complete. A re-download / remux
+        changes mtime|size -> the guard lifts and it's retried. A NULL-mtime row (file was gone at
+        failure) never matches -> retried if it reappears."""
+        row = self.conn.execute(
+            "SELECT mtime, size FROM problems WHERE path = ?", (str(path),)).fetchone()
+        if row is None or row["mtime"] is None:
+            return False
+        return abs(row["mtime"] - st.st_mtime) <= self.mtime_tol and row["size"] == st.st_size
 
     def problems(self, category: str | None = None) -> list[tuple[str, str, str, str | None]]:
         """(path, error, category, repair_note). Filters by 'corrupt'|'reindex' if given.
@@ -257,24 +283,19 @@ class FingerprintStore:
                     "WHERE audio_coverage IS NOT NULL AND audio_coverage < ? "
                     "ORDER BY audio_coverage", (threshold,))]
 
-    def prune_missing_problems(self) -> int:
-        """Self-heal (§2): forgets problems whose file NO LONGER exists but whose parent folder IS
-        reachable. Distinguishes 'deleted/moved' from 'volume unmounted': if even the parent
-        directory is gone, the disk may be offline -> do NOT touch (don't delete 69 rows because L:
-        is not mounted). Returns how many were forgotten."""
-        gone = []
-        for r in self.conn.execute("SELECT path FROM problems"):
-            p = r["path"]
-            try:
-                parent = os.path.dirname(p) or "."
-                if not os.path.exists(p) and os.path.isdir(parent):
-                    gone.append(p)
-            except OSError:
-                pass                               # weird path (dead UNC): leave it alone to be safe
-        for p in gone:
-            self.conn.execute("DELETE FROM problems WHERE path=?", (p,))
-        if gone:
-            self.conn.commit()
+    def prune_missing_problems(self, *, exists=os.path.exists, isdir=os.path.isdir,
+                               ismount=None) -> int:
+        """Self-heal (§2): forgets problems whose file is REALLY gone, with the SAME volume+mount-aware
+        guard as prune_missing_files (shared decision core, `_missing_on_online_volume`): a whole
+        deleted SUBFOLDER on an ONLINE volume is cleaned (Mode B), while an offline drive or a
+        disconnected nested mount/junction is never mistaken for a deletion. The old parent-dir guard
+        ('parent isdir => truly deleted') skipped Mode B — the deleted folder IS the parent — so
+        problems of deleted folders lingered forever in the Problems tab. `exists`/`isdir`/`ismount`
+        injectable for deterministic tests (§0). Returns how many were forgotten."""
+        paths = [r["path"] for r in self.conn.execute("SELECT path FROM problems")]
+        gone = _missing_on_online_volume(paths, exists, isdir, ismount or _is_mount)
+        with self.conn:                            # one transaction, not one commit per row
+            self.conn.executemany("DELETE FROM problems WHERE path=?", [(p,) for p in gone])
         return len(gone)
 
     def prune_missing_files(self, *, exists=os.path.exists, isdir=os.path.isdir,
@@ -296,22 +317,10 @@ class FingerprintStore:
         `exists`/`isdir`/`ismount` are injectable so the decision core is deterministic and unit-testable
         without real drives/junctions (§0). Does NOT rebuild clusters (the caller owns that, like
         actions.delete_files) and never touches the `problems` table. Returns how many were forgotten."""
-        ismount = ismount or _is_mount
-        by_anchor: dict[str, list[str]] = {}
-        for p in self.all_paths():
-            by_anchor.setdefault(_volume_root(p), []).append(p)
-        gone: list[str] = []
-        for anchor, paths in by_anchor.items():
-            if not _volume_reachable(anchor, exists):     # unknown form or offline drive -> keep all (§2)
-                continue
-            for p in paths:
-                try:
-                    if not exists(p) and _real_deletion(p, anchor, isdir, ismount):
-                        gone.append(p)                    # gone, volume online, no offline mount above
-                except OSError:
-                    pass                                  # dead UNC / weird path -> leave it (be safe)
-        for p in gone:
-            self.forget_file(p)                           # atomic: row + matches + cluster + .npy
+        gone = _missing_on_online_volume(self.all_paths(), exists, isdir, ismount or _is_mount)
+        with self.conn:                                   # ONE transaction: a folder prune is N files,
+            for p in gone:                                # N commits (fsyncs) would pay per row
+                self.forget_file(p, commit=False)         # row + matches + cluster + .npy
         return len(gone)
 
     def mark_repair_failed(self, path: str, kind: str, reason: str) -> None:
@@ -379,13 +388,18 @@ class FingerprintStore:
         ).fetchall()
         return [r["path"] for r in rows]
 
-    def find_by_hash(self, content_hash: str, feature_version: str) -> str | None:
+    def find_by_hash(self, content_hash: str, feature_version: str,
+                     size: int | None = None) -> str | None:
         """M4: is there a byte-identical file already indexed with the same feature_version?
-        If so, cloning its features avoids re-decoding+embedding (the expensive step)."""
-        row = self.conn.execute(
-            "SELECT path FROM files WHERE content_hash = ? AND feature_version = ? LIMIT 1",
-            (content_hash, feature_version),
-        ).fetchone()
+        If so, cloning its features avoids re-decoding+embedding (the expensive step).
+        `size` narrows to true byte-identity candidates: the hash is SAMPLED (head|mid|tail), so
+        equal size is required to claim identity — the same standard the T0 tier applies (§0)."""
+        sql = "SELECT path FROM files WHERE content_hash = ? AND feature_version = ?"
+        args: list = [content_hash, feature_version]
+        if size is not None:
+            sql += " AND size = ?"
+            args.append(size)
+        row = self.conn.execute(sql + " LIMIT 1", args).fetchone()
         return row["path"] if row else None
 
     def _row_to_record(self, row: sqlite3.Row, with_embeddings: bool) -> Record:
@@ -402,8 +416,7 @@ class FingerprintStore:
 
         ep = row["emb_path"]
         if with_embeddings and ep:
-            emb_file = Path(ep) if os.path.isabs(ep) else self.emb_dir / ep
-            emb = np.load(emb_file, mmap_mode=None)
+            emb = np.load(self._emb_file(ep), mmap_mode=None)
         else:
             emb = np.empty((0, 0))
         d = row["emb_dim"] or 0
@@ -495,6 +508,25 @@ class FingerprintStore:
         return [(r["a_path"], r["b_path"], r["verdict"])
                 for r in self.conn.execute("SELECT a_path, b_path, verdict FROM matches")]
 
+    # ---- evaluated-pairs ledger (incremental Pass-2) -------------------
+    def evaluated_pairs_load(self, fingerprint: str) -> set[str]:
+        """Pair-hashes already ALIGNED under THIS fingerprint (feature_version + thresholds), so the
+        next scan can skip re-aligning them. Prunes rows from any OTHER fingerprint first: an algorithm
+        or θ change invalidates them (a pair that was DIFFERENT could become a match under looser θ)."""
+        self.conn.execute("DELETE FROM evaluated_pairs WHERE fingerprint != ?", (fingerprint,))
+        self.conn.commit()
+        return {r[0] for r in self.conn.execute(
+            "SELECT pair_hash FROM evaluated_pairs WHERE fingerprint = ?", (fingerprint,))}
+
+    def evaluated_pairs_add(self, pair_hashes, fingerprint: str) -> None:
+        """Record aligned pairs (match OR DIFFERENT) under `fingerprint`. Idempotent per pair_hash."""
+        rows = [(h, fingerprint) for h in pair_hashes]
+        if not rows:
+            return
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO evaluated_pairs(pair_hash, fingerprint) VALUES (?, ?)", rows)
+        self.conn.commit()
+
     def clear_clusters(self) -> None:
         """Clears the clusters table. Rebuilt entirely from `matches` on each
         full-scan: clusters are a DERIVED VIEW, not accumulated state. Without this,
@@ -574,23 +606,23 @@ class FingerprintStore:
         )
         self.conn.commit()
 
-    def forget_file(self, path: str) -> bool:
+    def forget_file(self, path: str, commit: bool = True) -> bool:
         """Forgets a deleted file: removes its `files` row, its matches and cluster membership,
         and deletes its `.npy` embeddings file. Prevents 'ghosts' after deletion. Returns True if a
         `files` row actually existed (let the event-drain count only real removals and ignore a path
-        whose stored form didn't match — it falls through to the periodic full sweep)."""
+        whose stored form didn't match — it falls through to the periodic full sweep).
+        `commit=False` lets a batch caller (prune_missing_files) fold N forgets into ONE transaction."""
         row = self.conn.execute("SELECT emb_path FROM files WHERE path=?", (str(path),)).fetchone()
         if row and row["emb_path"]:
-            ep = row["emb_path"]
-            emb_file = Path(ep) if os.path.isabs(ep) else self.emb_dir / ep
             try:
-                emb_file.unlink(missing_ok=True)
+                self._emb_file(row["emb_path"]).unlink(missing_ok=True)
             except OSError:
                 pass
         self.conn.execute("DELETE FROM files WHERE path=?", (str(path),))
         self.conn.execute("DELETE FROM matches WHERE a_path=? OR b_path=?", (str(path), str(path)))
         self.conn.execute("DELETE FROM clusters WHERE path=?", (str(path),))
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
         return row is not None
 
     def close(self) -> None:
@@ -639,11 +671,14 @@ def _volume_root(path: str) -> str:
     """The mountable VOLUME a path lives on, as a fail-safe anchor: a Windows DRIVE root ('L:\\') or a
     UNC SHARE root ('\\\\srv\\share\\'), or POSIX '/'. Returns '' (UNKNOWN -> never touched) for forms
     that would probe the WRONG thing and mass-forget: a relative/unanchored path, a drive-RELATIVE
-    anchor ('C:foo' -> 'C:', no root), or a degenerate single-separator 'UNC' ('\\' / '/x' whose anchor
-    is a bare separator that os.path.exists resolves to the current drive). Detect, don't trust."""
+    anchor ('C:foo' -> 'C:', no root), or a degenerate bare-backslash 'UNC' ('\\x' / '/x' on Windows,
+    whose anchor '\\' os.path.exists resolves to the current drive). POSIX '/' is the real, single
+    volume root (always present; Path normalizes it to '\\' on Windows, so it never means POSIX there)
+    — rejecting it would make the whole sweep a silent no-op on Linux; nested-mount protection there
+    leans on the per-file `_real_deletion` walk (os.path.ismount). Detect, don't trust."""
     a = Path(path).anchor
-    if not a or a in ("\\", "/"):
-        return ""                                         # relative, or bare-separator (degenerate UNC)
+    if not a or a == "\\":
+        return ""                                         # relative, or bare-backslash (degenerate UNC)
     if len(a) >= 2 and a[1] == ":" and not a.endswith(("\\", "/")):
         return ""                                         # drive-relative 'C:foo' -> 'C:' (no root)
     return a
@@ -668,6 +703,28 @@ def _is_mount(path: str) -> bool:
         return Path(path).is_junction()                   # Python 3.12+
     except (OSError, AttributeError):
         return False
+
+
+def _missing_on_online_volume(paths, exists, isdir, ismount) -> list[str]:
+    """Shared decision core of prune_missing_files / prune_missing_problems (§2 self-heals): of
+    `paths`, those whose bytes are REALLY gone — the volume is online AND no disconnected
+    mount/junction sits between the path and the nearest present directory. Fail-SAFE both ways:
+    an unknown/degenerate anchor or an offline volume keeps ALL its paths (an unmount must never
+    read as a mass deletion), and any OSError on a probe keeps that path."""
+    by_anchor: dict[str, list[str]] = {}
+    for p in paths:
+        by_anchor.setdefault(_volume_root(p), []).append(p)
+    gone: list[str] = []
+    for anchor, ps in by_anchor.items():
+        if not _volume_reachable(anchor, exists):         # unknown form or offline drive -> keep all (§2)
+            continue
+        for p in ps:
+            try:
+                if not exists(p) and _real_deletion(p, anchor, isdir, ismount):
+                    gone.append(p)                        # gone, volume online, no offline mount above
+            except OSError:
+                pass                                      # dead UNC / weird path -> leave it (be safe)
+    return gone
 
 
 def _real_deletion(path: str, anchor: str, isdir, ismount) -> bool:

@@ -161,7 +161,7 @@ def scan(
                f"review: {len(report['review_queue'])} | "
                f"editions: {len(report['editions'])} | "
                f"skipped: {len(skipped)} | -> {out}")
-    allprobs = store.iter_problems()
+    allprobs = store.problems()
     if allprobs:
         typer.echo(f"DB: {len(allprobs)} problematic file(s) in table 'problems' "
                    f"(query: SELECT * FROM problems)")

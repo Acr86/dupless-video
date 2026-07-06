@@ -18,7 +18,7 @@ import os
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -50,6 +50,29 @@ def feature_version(embedder: Embedder, independent_scenes: bool = False,
         afp += f"G{int(audio_fp_cap_above_s)}C{int(audio_fp_cap_s)}"
     return (f"{embedder.feature_version}|{afp}|cov{COVERAGE_VERSION}|clr{COLOR_VERSION}"
             f"|scn{mode}{SCENE_ALGO_VERSION}")
+
+
+def analysis_state(store: FingerprintStore, path: str, fv: str, *,
+                   stable_s: float = 0.0, now: float | None = None) -> str:
+    """THE freshness contract, in ONE place — the full scan and both watcher lanes consume it, so
+    they can never disagree on what 'needs analysis' means (a divergence here is how mid-scan and
+    watcher bookkeeping drift apart). States, in evaluation order:
+      'gone'    — unstattable (vanished between listing and stat, or unreadable metadata)
+      'copying' — modified within the last `stable_s` seconds (mid-copy -> retry next cycle)
+      'done'    — already fresh under `fv`, OR already FAILED and unchanged since (known-corrupt:
+                  don't re-decode it every sweep)
+      'pending' — new or changed -> analyze
+    `stable_s=0` disables the mid-copy debounce (the full scan takes files as they are);
+    `now` injectable for tests."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return "gone"
+    if stable_s and ((time.time() if now is None else now) - st.st_mtime) < stable_s:
+        return "copying"
+    if store.has_fresh(path, st, fv) or store.has_unchanged_problem(path, st):
+        return "done"
+    return "pending"
 
 
 @dataclass
@@ -96,17 +119,49 @@ def extract_cpu_features(path: str, independent_scenes: bool = False) -> CpuFeat
 
 
 def ensure_audio_coverage(path: str, store: FingerprintStore, duration_s: float,
-                          has_audio: bool) -> float:
+                          has_audio: bool, n_points: int = 40) -> float:
     """ON-DEMAND whole-file audio coverage (muted/truncated-copy signal). Computed-if-missing and
     persisted, mirroring the audio-fp pattern: NULL in the DB = not computed yet. Checks the RAW
     column (not the NULL->1.0 loaded value) so 'already computed as 1.0' and 'not computed' don't
-    collapse. Used by rank_cluster (cluster members) and by the Deep depth (all files)."""
+    collapse. Used by rank_cluster (cluster members) and by the Deep depth (all files).
+
+    `n_points`: how many positions to seek-sample. The KEEP muted-check (rank_cluster) passes a small
+    value — detecting a muted/silent copy needs far fewer probes than precise coverage, and on a
+    spinning HDD each probe is a seek (40 points on a 44GB file measured ~28s vs ~3s at 8). The Deep
+    'coverage for ALL files' path keeps the default (40) for precise truncation reporting. Cached, so
+    a value computed once (at any granularity) is reused — re-runs never recompute."""
     row = store.conn.execute("SELECT audio_coverage FROM files WHERE path=?", (str(path),)).fetchone()
     if row is not None and row[0] is not None:
         return float(row[0])                         # already computed -> reuse (incremental)
-    cov = scan_audio_coverage(path, duration_s) if has_audio else 0.0
+    cov = scan_audio_coverage(path, duration_s, n_points=n_points) if has_audio else 0.0
     store.set_audio_coverage(str(path), cov)
     return cov
+
+
+def record_from_donor(cpu: CpuFeatures, store: FingerprintStore, fv: str):
+    """M4 short-circuit: a byte-identical file (same SAMPLED hash AND size — the T0 standard, §0)
+    already indexed under the SAME feature_version donates its content-derived features, so a MOVED
+    or copied file skips the expensive decode+embed (~seconds -> ~the hash it already paid).
+    IDENTITY fields are NOT cloned: path/mtime/size/probe/content_hash come from THIS file's fresh
+    CPU features — no stale data can survive the clone. The donor's audio_coverage is re-read RAW
+    from the DB because load() folds NULL -> 1.0 ('not computed yet' would become a fake 'complete
+    audio' and could mask a muted copy). Fail-open: no donor / unloadable .npy / no embeddings ->
+    None, and the caller runs the full analysis."""
+    donor_path = store.find_by_hash(cpu.content_hash, fv, size=cpu.size)
+    if donor_path is None:
+        return None
+    try:
+        donor = store.load(donor_path, with_embeddings=True)
+    except OSError:                                # orphaned/moved .npy -> can't donate embeddings
+        return None
+    if donor is None or donor.embeddings is None or not donor.embeddings.size:
+        return None                                # LITE/degenerate donor -> full analysis
+    raw_cov = store.conn.execute("SELECT audio_coverage FROM files WHERE path=?",
+                                 (donor_path,)).fetchone()
+    quality = replace(donor.quality,
+                      audio_coverage=(raw_cov[0] if raw_cov is not None else None))
+    return replace(donor, path=cpu.path, mtime=cpu.mtime, size=cpu.size,
+                   probe=cpu.probe, content_hash=cpu.content_hash, quality=quality)
 
 
 def build_record(cpu: CpuFeatures, emb: np.ndarray, times: np.ndarray, color: ColorStats,
@@ -216,7 +271,8 @@ def _emit_viz_burst(name: str, rgb_batch: np.ndarray) -> None:
 def analyze_file(path: str, store: FingerprintStore, embedder: Embedder,
                  th: Thresholds, force: bool = False,
                  independent_scenes: bool = False) -> Record:
-    """Single-file path (watcher). Incremental + short-circuit by hash (M4)."""
+    """Single-file path (watcher). Incremental + short-circuit by hash (M4: a byte-identical file
+    already indexed — a MOVE/copy — donates its features, skipping the decode+embed)."""
     st = os.stat(path)
     fv = feature_version(embedder, independent_scenes,
                          audio_fp_cap_s=th.audio_fp_cap_s, audio_fp_cap_above_s=th.audio_fp_cap_above_s)
@@ -226,7 +282,9 @@ def analyze_file(path: str, store: FingerprintStore, embedder: Embedder,
             return cached
 
     cpu = extract_cpu_features(path, independent_scenes=independent_scenes)
-    emb, times, color = extract_gpu_features(path, cpu.probe, embedder, th)   # keyframes NVDEC (fast)
-    rec = build_record(cpu, emb, times, color, embedder, th, independent_scenes)
+    rec = record_from_donor(cpu, store, fv)        # M4: moved/copied byte-identical file
+    if rec is None:
+        emb, times, color = extract_gpu_features(path, cpu.probe, embedder, th)  # keyframes NVDEC
+        rec = build_record(cpu, emb, times, color, embedder, th, independent_scenes)
     store.save(rec, feature_version=fv)
     return rec

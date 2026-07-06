@@ -100,11 +100,14 @@ def test_duration_blocking(store):
 
 
 def test_find_by_hash_respects_feature_version(store):
-    """M4: the short-circuit only applies with the SAME feature_version."""
+    """M4: the short-circuit only applies with the SAME feature_version, and (when given) the SAME
+    size — the hash is SAMPLED, so equal size is required to claim byte-identity (the T0 standard)."""
     rec = _rec("/lib/movie.mkv")
     store.save(rec, feature_version=FV)
     assert store.find_by_hash("abc123", FV) == "/lib/movie.mkv"
     assert store.find_by_hash("abc123", "OTHER") is None
+    assert store.find_by_hash("abc123", FV, size=rec.size) == "/lib/movie.mkv"
+    assert store.find_by_hash("abc123", FV, size=rec.size + 1) is None
 
 
 def test_has_fresh_invalidated_by_feature_version(store, tmp_path):
@@ -124,13 +127,26 @@ def test_has_fresh_invalidated_by_feature_version(store, tmp_path):
 def test_problems_persistence_and_auto_cleanup(store):
     """The problems table stores (path, error) and is CLEARED when that path is analyzed OK."""
     store.save_problem("/lib/broken.mkv", "moov atom not found")
-    probs = store.iter_problems()
+    probs = [(p, e) for p, e, *_ in store.problems()]
     assert probs == [("/lib/broken.mkv", "moov atom not found")]
 
     # if that same path is later saved OK (Record), it disappears from problems
     rec = _rec("/lib/broken.mkv")
     store.save(rec, feature_version=FV)
-    assert store.iter_problems() == []
+    assert store.problems() == []
+
+
+def test_has_unchanged_problem_guards_known_corrupt(tmp_path):
+    """save_problem stamps mtime+size; has_unchanged_problem is True only while the file is unchanged
+    -> the scan/watcher skips a known-corrupt file instead of re-decoding it every cycle."""
+    s = FingerprintStore(tmp_path / "p.sqlite")
+    f = tmp_path / "broken.mp4"; f.write_bytes(b"x" * 100)
+    assert s.has_unchanged_problem(str(f), os.stat(f)) is False    # no problem recorded yet
+    s.save_problem(str(f), "moov atom not found", "corrupt")
+    assert s.has_unchanged_problem(str(f), os.stat(f)) is True     # known + unchanged -> skip
+    f.write_bytes(b"x" * 200)                                      # re-downloaded (size changed)
+    assert s.has_unchanged_problem(str(f), os.stat(f)) is False    # changed -> retry
+    s.close()
 
 
 def test_emb_path_relative_relocatable(tmp_path):

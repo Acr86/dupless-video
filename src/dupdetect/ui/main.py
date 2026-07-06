@@ -7,7 +7,7 @@ import os
 import re
 from pathlib import Path
 
-from PySide6.QtCore import QProcess, QProcessEnvironment, QSettings, Qt, QTimer
+from PySide6.QtCore import QProcess, QProcessEnvironment, QSettings, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QDialog, QDialogButtonBox,
@@ -46,6 +46,37 @@ def _fmt_eta(seconds: int) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"
 
 
+class _PruneWorker(QThread):
+    """Disk reconcile OFF the GUI thread: prune_missing_files is an O(library) exists() sweep (plus a
+    cluster rebuild when something was forgotten) — cheap on a warm MFT but potentially seconds on a
+    cold spinning disk, and it used to run synchronously on the Qt main thread (frozen window on
+    open/↻). Opens its OWN store handle (SQLite connections are per-thread; WAL lets it write while
+    the GUI reads) and emits `done(n)` — a queued cross-thread signal — so the GUI refreshes safely.
+    A failure is REPORTED (§2 skip-and-report), never raised into the UI."""
+    done = Signal(int)                                   # how many missing files were forgotten
+
+    def __init__(self, db_path: str, parent=None):
+        super().__init__(parent)
+        self._db = db_path
+
+    def run(self):
+        n = 0
+        try:
+            from dupdetect.config import load_thresholds
+            from dupdetect.pipeline.fullscan import _rebuild_clusters, _snapshot_clusters
+            store = FingerprintStore(self._db)
+            try:
+                prior = _snapshot_clusters(store)        # reuse ranking of UNCHANGED clusters (cheap)
+                n = store.prune_missing_files()
+                if n:                                    # forgot >=1 file -> the match graph changed
+                    _rebuild_clusters(store, load_thresholds(), reuse=prior)
+            finally:
+                store.close()
+        except Exception as e:                           # noqa: BLE001 — reconcile must not break the UI
+            print(f"[ui] disk reconcile failed ({e!r}) — list left as-is", flush=True)
+        self.done.emit(n)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, db_path: str):
         super().__init__()
@@ -54,6 +85,7 @@ class MainWindow(QMainWindow):
         self.store = FingerprintStore(db_path)
         self._hdr_ready: set = set()                    # trees whose header already has defaults applied
         self._persisted: set = set()                    # trees restored from a previous session
+        self._prune_worker: _PruneWorker | None = None  # background disk reconcile (one at a time)
         self.setWindowTitle(f"Dupless Video · Duplicates — {db_path}")
         _icon = Path(__file__).with_name("icon.ico")
         if _icon.exists():
@@ -248,7 +280,7 @@ class MainWindow(QMainWindow):
         _ver.setStyleSheet("color: gray;")
         _ver.setToolTip("Dupless Video version")
         self.statusBar().addPermanentWidget(_ver)
-        self._refresh_with_prune()                      # on open: reconcile the list with disk first
+        self._refresh_with_prune()                      # on open: paint now, reconcile with disk in bg
         QTimer.singleShot(0, self._maybe_onboard)       # one-time intro (after the window is shown)
         if startup.is_enabled() and self.watch_panel.folder.text().strip():
             QTimer.singleShot(1500, self._autostart_watch)   # resume watching when launched at login
@@ -266,27 +298,34 @@ class MainWindow(QMainWindow):
         self._refresh_with_prune()                       # new DB: reconcile its list with disk too
 
     def _refresh_with_prune(self):
-        """Reconcile the duplicates list with disk, then refresh. Forgets files deleted OUTSIDE the app
-        (the watcher may not be running) using the store's volume+mount-aware guard, then rebuilds only
-        the clusters a removal touched (reuse -> no whisper/audio on the rest) and reloads. Wired to
-        OPEN, switch_db, the ↻ button and 'Clean missing' — NEVER the per-keystroke filter signals.
+        """Refresh NOW (instant paint), then reconcile the duplicates list with disk on a WORKER
+        thread (see _PruneWorker) and refresh AGAIN only if something was forgotten — the O(library)
+        exists() sweep no longer freezes the GUI thread on a cold disk. Forgets files deleted OUTSIDE
+        the app (the watcher may not be running) using the store's volume+mount-aware guard, rebuilding
+        only the clusters a removal touched (reuse -> no whisper/audio on the rest). Wired to OPEN,
+        switch_db, the ↻ button and 'Clean missing' — NEVER the per-keystroke filter signals.
 
-        SKIPPED while a user SCAN holds the priority lock: the scan is re-persisting matches and owns the
-        disk, so we neither race its concurrent-deletion guard (§0) nor compete for the HDD (§1); the
-        next open/refresh (or the watcher) reconciles once it finishes. A failure here must never break
-        the view -> on any error fall back to a plain refresh (§2)."""
+        The reconcile is SKIPPED while a user SCAN holds the priority lock (the scan is re-persisting
+        matches and owns the disk: don't race its concurrent-deletion guard §0 or compete for the HDD
+        §1) and while a previous reconcile is still running. A failure is reported, never raised (§2)."""
+        self.refresh()
         try:
             from dupdetect.runtime import scan_in_progress
             if scan_in_progress():
-                self.refresh(); return
-            from dupdetect.config import load_thresholds
-            from dupdetect.pipeline.fullscan import _rebuild_clusters, _snapshot_clusters
-            prior = _snapshot_clusters(self.store)       # reuse ranking of UNCHANGED clusters (cheap)
-            if self.store.prune_missing_files():         # forgot >=1 file -> the match graph changed
-                _rebuild_clusters(self.store, load_thresholds(), reuse=prior)
-        except Exception:                                # noqa: BLE001 — reconcile must not break the UI
-            pass
-        self.refresh()
+                return                                   # the next open/↻ (or the watcher) reconciles
+            if self._prune_worker is not None and self._prune_worker.isRunning():
+                return                                   # one reconcile at a time
+            self._prune_worker = _PruneWorker(self._db_path, parent=self)
+            self._prune_worker.done.connect(self._on_prune_done)
+            self._prune_worker.start()
+        except Exception as e:                           # noqa: BLE001 — reconcile must not break the UI
+            print(f"[ui] disk reconcile skipped ({e!r}) — showing the list as stored", flush=True)
+
+    def _on_prune_done(self, n: int):
+        """Background reconcile finished: reload only if it actually forgot something."""
+        if n:
+            self.refresh()
+            self._toast(f"{n} missing file(s) forgotten (deleted outside the app).")
 
     def _on_watch_dups(self, n: int):
         """The background watcher found new duplicate clusters: a silent in-app toast + refresh, never
@@ -391,6 +430,10 @@ class MainWindow(QMainWindow):
     # ----------------------------------------------------------------- vista
     def refresh(self):
         clusters = load_clusters(self.store)
+        # Tab badge: the count of duplicate GROUPS, like the other tabs carry their item count in
+        # (). Uses the UNFILTERED total so it's a stable indicator (the search box / filter dropdown
+        # below the tab narrow the view, but the tab keeps showing how many duplicates exist).
+        self.tabs.setTabText(0, f"Duplicates ({len(clusters)})")
         f = self.filt.currentData()
         if f == "actionable":
             clusters = [c for c in clusters if is_actionable(c)]

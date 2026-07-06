@@ -31,7 +31,6 @@ def test_store_category_filter_and_clear(tmp_path):
     assert {p for p, *_ in s.problems(category="corrupt")} == {"/b.mp4"}
     assert len(s.problems()) == 3
     assert all(len(t) == 4 for t in s.problems())                 # (path, error, category, repair_note)
-    assert all(len(t) == 2 for t in s.iter_problems())            # compat: 2-tuples
     s.clear_problem("/a.mkv")
     assert {p for p, *_ in s.problems(category="reindex")} == {"/c.avi"}
     s.close()
@@ -61,17 +60,56 @@ def test_mark_repair_failed_hard_moves_to_corrupt(tmp_path):
     s.close()
 
 
-def test_prune_missing_problems_forgets_deleted_not_offline(tmp_path):
-    """Forgets a problem whose file no longer exists but whose FOLDER does (truly deleted); does NOT
-    touch one whose folder also does not exist (possible unmounted volume)."""
+def test_prune_missing_problems_forgets_deleted_on_online_volume(tmp_path):
+    """A problem row whose file is gone (folder still present) on an ONLINE volume is forgotten."""
     s = FingerprintStore(tmp_path / "p.sqlite")
-    real = tmp_path / "deleted.mkv"                               # folder (tmp_path) exists, file does not
-    s.save_problem(str(real), "moov atom not found")
-    s.save_problem("/offline_disk/x.mkv", "moov atom not found")  # folder doesn't exist either
-    n = s.prune_missing_problems()
-    assert n == 1
-    paths = {p for p, *_ in s.problems()}
-    assert str(real) not in paths and "/offline_disk/x.mkv" in paths
+    p = str(tmp_path / "Media" / "deleted.mkv")
+    s.save_problem(p, "moov atom not found")
+    n = s.prune_missing_problems(exists=lambda x: x != p,          # all present except the file
+                                 isdir=lambda x: True, ismount=lambda x: False)
+    assert n == 1 and s.problems() == []
+    s.close()
+
+
+def test_prune_missing_problems_mode_b_deleted_folder(tmp_path):
+    """Mode B (the residual ghost bug): the file's whole FOLDER was deleted while the volume stayed
+    online. The old parent-dir guard read 'parent gone' as 'volume offline' and kept the row forever
+    in the Problems tab; the shared volume+mount-aware core (same as prune_missing_files) cleans it."""
+    s = FingerprintStore(tmp_path / "p.sqlite")
+    folder = str(tmp_path / "Media" / "OldShow")
+    p = os.path.join(folder, "ep.mkv")
+    s.save_problem(p, "moov atom not found")
+    n = s.prune_missing_problems(
+        exists=lambda x: not x.startswith(folder),                # volume + Media online; OldShow gone
+        isdir=lambda x: not x.startswith(folder),                 # OldShow and below: not a dir
+        ismount=lambda x: False)                                  # plain deleted folder, not a mount
+    assert n == 1 and s.problems() == []
+    s.close()
+
+
+def test_prune_missing_problems_keeps_offline_drive(tmp_path):
+    """§2 fail-safe: the whole drive reads offline -> its problem rows are never touched."""
+    from dupdetect.store.store import _volume_root
+    s = FingerprintStore(tmp_path / "p.sqlite")
+    p = str(tmp_path / "x.mkv")
+    s.save_problem(p, "moov atom not found")
+    anchor = _volume_root(p)
+    n = s.prune_missing_problems(exists=lambda x: x not in (anchor, p))   # drive itself unreachable
+    assert n == 0 and [pp for pp, *_ in s.problems()] == [p]
+    s.close()
+
+
+def test_prune_missing_problems_keeps_offline_junction_subtree(tmp_path):
+    """§2: an offline nested mount/junction under an online volume is an unmount, NOT a deletion."""
+    s = FingerprintStore(tmp_path / "p.sqlite")
+    junction = str(tmp_path / "Media" / "NAS")
+    p = os.path.join(junction, "ep.mkv")
+    s.save_problem(p, "moov atom not found")
+    n = s.prune_missing_problems(
+        exists=lambda x: not x.startswith(junction),              # volume/Media online; NAS unreachable
+        isdir=lambda x: not x.startswith(junction),               # NAS doesn't resolve (offline target)
+        ismount=lambda x: x == junction)                          # NAS IS a junction/mount
+    assert n == 0 and [pp for pp, *_ in s.problems()] == [p]
     s.close()
 
 

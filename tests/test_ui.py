@@ -56,6 +56,21 @@ def _rec(path, h=1080, size=1_000_000_000, br=5000, lang="eng", audio_cov=1.0):
                   quality=Quality(lang_detected=lang, audio_coverage=audio_cov))
 
 
+def _quiet_reconcile(monkeypatch):
+    """MainWindow tests use SYNTHETIC paths ('/x') that don't exist on disk: the on-open disk
+    reconcile (background _PruneWorker) and the problems prune in refresh would forget those fixtures
+    (their POSIX anchor '/' is a reachable volume on Linux CI). Neutralize both sweeps here; their
+    real behavior is covered by test_perf_opts."""
+    monkeypatch.setattr(FingerprintStore, "prune_missing_files", lambda self, **k: 0)
+    monkeypatch.setattr(FingerprintStore, "prune_missing_problems", lambda self, **k: 0)
+
+
+def _settle(w):
+    """Join the background reconcile worker so a test never races it (nor leaks a live QThread)."""
+    if getattr(w, "_prune_worker", None) is not None:
+        w._prune_worker.wait(5000)
+
+
 # --------------------------------------------------------------- error summary (scan failure UI)
 
 # The actual Rich-rendered traceback the scan subprocess emitted on the empty-embeddings crash.
@@ -290,10 +305,8 @@ def test_switch_db_reloads_tree(tmp_path, monkeypatch):
 
     from dupdetect.ui.main import MainWindow
 
-    # This test uses SYNTHETIC top-level paths ('/c0_k', …) that don't exist on disk; the on-open
-    # existence sweep is covered by its own tests (test_perf_opts) — neutralize it here so it doesn't
-    # forget the fixtures (their POSIX anchor '/' reads as a reachable volume on Linux CI).
-    monkeypatch.setattr(FingerprintStore, "prune_missing_files", lambda self, **k: 0)
+    # SYNTHETIC top-level paths ('/c0_k', …) that don't exist on disk -> neutralize the sweeps.
+    _quiet_reconcile(monkeypatch)
 
     def mkdb(name, n):
         st = FingerprintStore(tmp_path / name)
@@ -308,9 +321,50 @@ def test_switch_db_reloads_tree(tmp_path, monkeypatch):
     a, b = mkdb("A.sqlite", 1), mkdb("B.sqlite", 3)
     QApplication.instance() or QApplication([])
     w = MainWindow(a)
+    _settle(w)
     assert w.model.invisibleRootItem().rowCount() == 1
+    assert "(1)" in w.tabs.tabText(0)                      # Duplicates tab carries the group count
     w.switch_db(b)                                         # DB switch -> reload
+    _settle(w)
     assert w.model.invisibleRootItem().rowCount() == 3 and w._db_path == b
+    assert "(3)" in w.tabs.tabText(0)                      # badge tracks the switched DB
+
+
+def test_refresh_with_prune_runs_in_background_and_reloads(tmp_path, monkeypatch):
+    """The on-open disk reconcile runs OFF the GUI thread (_PruneWorker): the window paints
+    immediately with the stored list, and when the worker forgets a missing file the queued done(n)
+    triggers a refresh that drops the ghost (and its collapsed singleton cluster) from the tree."""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+
+    import dupdetect.ui.main as _m
+    from dupdetect.ui.main import MainWindow
+    # processEvents() below delivers EVERY pending zero-timer in the shared QApplication — including
+    # the onboarding singleShots of MainWindows built by EARLIER tests (their bound _maybe_onboard was
+    # captured pre-patch, so patching the method is not enough). _mbox is resolved at CALL time in the
+    # module -> patching it neutralizes every pending modal dialog (which would block forever offscreen).
+    monkeypatch.setattr(_m, "_mbox", lambda *a, **k: 0)
+
+    db = tmp_path / "bg.sqlite"
+    st = FingerprintStore(db)
+    present = tmp_path / "keep.mkv"
+    present.write_bytes(b"x")
+    gone = tmp_path / "gone.mkv"                         # never created on disk == deleted outside
+    for p in (str(present), str(gone)):
+        st.save(_rec(p), feature_version="fv")
+        st.save_cluster(0, p, is_keep=(p == str(present)))
+    st.save_match(str(present), str(gone), "CERTAIN", 0.99, "T1")
+    st.close()
+    QApplication.instance() or QApplication([])
+    w = MainWindow(str(db))
+    assert w.model.invisibleRootItem().rowCount() == 1   # instant paint (ghost still visible)
+    _settle(w)                                           # join the worker...
+    QApplication.processEvents()                         # ...and deliver its queued done(n)
+    assert str(gone) not in w.store.all_paths()          # ghost forgotten in the DB
+    assert w.model.invisibleRootItem().rowCount() == 0   # singleton cluster collapsed on the refresh
+    w._really_quit = True
+    w.close()
 
 
 # ----------------------------------------------------- problem tree (reindex / corrupt)
@@ -355,8 +409,10 @@ def test_mainwindow_populates_problem_tabs(tmp_path, monkeypatch):
     st.save_problem("/r/slow.mkv", "timeout (>900s)")             # reindex candidate
     st.save_problem("/c/dead.mp4", "moov atom not found")         # corrupt candidate
     st.close()
+    _quiet_reconcile(monkeypatch)                        # synthetic paths -> don't prune the fixtures
     QApplication.instance() or QApplication([])
     w = MainWindow(str(db))
+    _settle(w)
     assert w.reindex_model.invisibleRootItem().rowCount() == 1
     assert w.corrupt_model.invisibleRootItem().rowCount() == 1
     assert "(1)" in w.tabs.tabText(1) and "(1)" in w.tabs.tabText(2)
@@ -379,14 +435,16 @@ def test_cluster_with_poor_audio_is_not_actionable(store):
     assert cl.keep is None                                                 # no auto-KEEP
 
 
-def test_rank_cluster_does_not_choose_keep_with_poor_audio(store):
-    """rank_cluster returns keep=None (and audio_warning) when any copy has bad audio."""
+def test_rank_cluster_escalates_to_copy_with_audio(store):
+    """Phase-1 escalation: when the best-by-resolution copy is MUTED but a (slightly lower) copy has
+    audio, KEEP the one with audio instead of blanket-reviewing. The 4K copy here is muted, so the
+    1080p-with-audio is promoted to KEEP and the cluster is clean (no warning)."""
     from dupdetect.config import load_thresholds
     from dupdetect.pipeline.fullscan import rank_cluster
-    store.save(_rec("/a.mkv", h=2160, audio_cov=0.1), feature_version="fv")  # 4K but clipped audio
+    store.save(_rec("/a.mkv", h=2160, audio_cov=0.1), feature_version="fv")  # 4K but muted audio
     store.save(_rec("/b.mkv", h=1080, audio_cov=1.0), feature_version="fv")  # 1080p with audio
     ranked = rank_cluster(["/a.mkv", "/b.mkv"], store, load_thresholds())
-    assert ranked["keep"] is None and ranked["audio_warning"] is True
+    assert ranked["keep"] == "/b.mkv" and ranked["audio_warning"] is False
 
 
 def test_cluster_same_truncated_audio_is_actionable(store):
@@ -439,6 +497,28 @@ def test_rank_keeps_4k_over_1080p_despite_color_clip(store):
     assert ranked["keep"] != "/c_1080.mp4"
 
 
+def test_color_adjust_never_picks_muted_least_clipped(store):
+    """Regression (muted-check + color-override interaction): the color downgrade must NOT re-point KEEP
+    onto a less-clipped but MUTED copy. The clean (audio-OK) but more-clipped copy stays KEEP."""
+    from dupdetect.config import load_thresholds
+    from dupdetect.models import Probe, Quality, Record
+    from dupdetect.pipeline.fullscan import rank_cluster
+    from dupdetect.quality.color import ColorStats
+
+    def _crec(path, h, clip, grade, cov):
+        return Record(path=path, mtime=0.0, size=1,
+                      probe=Probe(600.0, h * 16 // 9, h, "h264", 8000, []),
+                      content_hash=path, global_vec=np.zeros(8, np.float32),
+                      window_vecs=np.zeros((0, 8), np.float32), embeddings=np.zeros((0, 8), np.float16),
+                      audio_fp=np.zeros(0, np.uint32), scene_cuts=np.zeros(0, np.float32),
+                      quality=Quality(audio_coverage=cov, color=ColorStats(
+                          clip=clip, cast=grade, saturation=grade, contrast=grade)))
+    store.save(_crec("/clean_4k.mp4", 2160, 0.30, 0.10, 1.0), feature_version="fv")    # clean but clipped
+    store.save(_crec("/muted_1080.mp4", 1080, 0.00, 0.95, 0.0), feature_version="fv")  # least clip, MUTED
+    ranked = rank_cluster(["/clean_4k.mp4", "/muted_1080.mp4"], store, load_thresholds())
+    assert ranked["keep"] == "/clean_4k.mp4"             # the muted copy is never picked, even less-clipped
+
+
 def test_cluster_tooltip_explains_the_warning(store=None):
     """The ⚠ needs hover text so a first-time user knows what it means. cluster_tooltip is pure."""
     from dupdetect.ui.data import cluster_tooltip
@@ -469,8 +549,10 @@ def test_mainwindow_tab_quality_warnings(tmp_path, monkeypatch):
     st = FingerprintStore(db)
     st.save(_rec("/mute.mkv", audio_cov=0.0), feature_version="fv")
     st.close()
+    _quiet_reconcile(monkeypatch)                        # synthetic paths -> don't prune the fixtures
     QApplication.instance() or QApplication([])
     w = MainWindow(str(db))
+    _settle(w)
     assert w.audio_model.invisibleRootItem().rowCount() == 1
     assert "(1)" in w.tabs.tabText(3)
 
@@ -487,6 +569,7 @@ def test_close_to_tray_toggle_persists(tmp_path, monkeypatch):
     FingerprintStore(db).close()
     QApplication.instance() or QApplication([])
     w = MainWindow(str(db))
+    _settle(w)
     assert w._act_close_tray.isCheckable()
     w._set_close_to_tray(False)                          # X exits for real
     assert w._settings.value("close_to_tray", True, bool) is False
@@ -511,9 +594,11 @@ def test_set_as_master_keeps_cluster_visible(tmp_path, monkeypatch):
         st.save(r, feature_version="fv"); st.save_cluster(0, p, is_keep=keep)
     st.save_match("/milk_k.mp4", "/milk_d.mp4", "CERTAIN", 0.99, "T1")
     st.close()
+    _quiet_reconcile(monkeypatch)                        # synthetic paths -> don't prune the fixtures
     QApplication.instance() or QApplication([])
     from dupdetect.ui.main import MainWindow
     w = MainWindow(str(db))
+    _settle(w)
     w.sort.setCurrentIndex(1)            # Most reclaimable space
     w.filt.setCurrentIndex(0)            # CERTAIN + HIGH
     w.refresh()
@@ -576,6 +661,7 @@ def test_main_window_tray_session_count(tmp_path, monkeypatch):
     QApplication.instance() or QApplication([])
     from dupdetect.ui.main import MainWindow
     w = MainWindow(str(tmp_path / "u.sqlite"))
+    _settle(w)
     w._on_watch_cycle(5, 1, 0)
     w._on_watch_cycle(3, 0, 2)
     assert w._session_indexed == 8 and "8" in w._tray.toolTip()
@@ -592,6 +678,7 @@ def test_tray_watch_action_reflects_real_state(tmp_path, monkeypatch):
     QApplication.instance() or QApplication([])
     from dupdetect.ui.main import MainWindow
     w = MainWindow(str(tmp_path / "u.sqlite"))
+    _settle(w)
     monkeypatch.setattr(w.watch_panel, "is_watching", lambda: True)
     w._refresh_watch_action()
     assert "Pause" in w._act_watch.text()           # running -> the menu offers Pause

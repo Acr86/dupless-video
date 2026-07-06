@@ -66,6 +66,21 @@ def test_pending_files_new_changed_skips_fresh_and_midcopy(tmp_path):
     s.close()
 
 
+def test_pending_files_skips_unchanged_corrupt(tmp_path):
+    """A file that already FAILED analysis (corrupt) and hasn't changed must NOT be re-attempted every
+    sweep (it would just fail again and never let the count complete). A re-download lifts the guard."""
+    th = load_thresholds()
+    fv = feature_version(_DummyEmbedder(), False,
+                         audio_fp_cap_s=th.audio_fp_cap_s, audio_fp_cap_above_s=th.audio_fp_cap_above_s)
+    s = FingerprintStore(tmp_path / "w.sqlite")
+    bad = _vid(tmp_path / "bad.mp4"); _age(tmp_path / "bad.mp4")
+    s.save_problem(bad, "moov atom not found", "corrupt")          # already attempted -> failed
+    assert watch.pending_files(str(tmp_path), s, fv, stable_s=15.0) == []   # unchanged corrupt -> skip
+    Path(bad).write_bytes(b"y" * 4096); _age(tmp_path / "bad.mp4")          # re-downloaded (size changed)
+    assert bad in watch.pending_files(str(tmp_path), s, fv, stable_s=15.0)  # changed -> retry
+    s.close()
+
+
 def test_orphan_paths_finds_deleted(tmp_path):
     s = FingerprintStore(tmp_path / "w.sqlite")
     exists = _vid(tmp_path / "a.mp4"); st = os.stat(exists)
@@ -188,6 +203,7 @@ def test_watch_once_survives_corrupt_file(tmp_path, monkeypatch):
 def test_watch_loop_stops_and_polls(tmp_path, monkeypatch):
     """watch_loop runs cycles until stop() is True; sleep is injected (no real waiting)."""
     th = load_thresholds(); s = FingerprintStore(tmp_path / "w.sqlite")
+    monkeypatch.setattr(watch, "scan_in_progress", lambda: False)   # isolate from a stale real scan.lock
     cycles = {"n": 0}
     monkeypatch.setattr(watch, "reconcile_removals", lambda *a, **k: watch.CycleResult())
     monkeypatch.setattr(watch, "ingest_new",
@@ -203,6 +219,7 @@ def test_watch_loop_backoff_grows_idle_resets_on_activity(tmp_path, monkeypatch)
     """Idle cycles back off (×backoff up to max_interval) so a static library is barely touched;
     a cycle with activity resets to the base interval."""
     th = load_thresholds(); s = FingerprintStore(tmp_path / "w.sqlite")
+    monkeypatch.setattr(watch, "scan_in_progress", lambda: False)   # isolate from a stale real scan.lock
     intervals: list = []
     results = iter([watch.CycleResult(), watch.CycleResult(),
                     watch.CycleResult(indexed=1), watch.CycleResult()])
@@ -372,6 +389,7 @@ def test_watch_loop_keeps_gpu_cache_while_indexing(tmp_path, monkeypatch):
     th = load_thresholds(); s = FingerprintStore(tmp_path / "w.sqlite")
     emb = _DummyEmbedder()
     ctx = watch.WatchContext(str(tmp_path), s, emb, th)
+    monkeypatch.setattr(watch, "scan_in_progress", lambda: False)   # isolate from a stale real scan.lock
     monkeypatch.setattr(watch, "reconcile_removals", lambda *a, **k: watch.CycleResult())
     monkeypatch.setattr(watch, "ingest_new", lambda *a, **k: watch.CycleResult(indexed=3))  # active
     stops = iter([False, True])

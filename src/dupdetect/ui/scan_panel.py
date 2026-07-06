@@ -315,6 +315,9 @@ class ScanPanel(QGroupBox):
         elif "Pass 1" in line:
             self._advance_to("Analyze")
             self._phase_text = self._progress_text("Pass 1 (analysis)", line)
+        elif "grouping" in line:                         # Pass 2 (grouping + best copy) -> Group stage
+            self._advance_to("Group")
+            self._phase_text = self._progress_text("Grouping + best copy", line)
         elif "Pass 2" in line or "coarse index" in line:
             self._advance_to("Match")
             self._phase_text = self._progress_text("Pass 2 (duplicates)", line)

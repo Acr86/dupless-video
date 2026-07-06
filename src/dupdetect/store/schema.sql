@@ -58,6 +58,21 @@ CREATE TABLE IF NOT EXISTS matches (
     UNIQUE(a_path, b_path)
 );
 
+-- The UNIQUE above only serves a_path-prefix lookups; `a_path=? OR b_path=?` (forget_file on every
+-- deletion, the per-member ads check in cluster ranking) needs b_path covered too or it scans the
+-- whole table per call — and a folder prune is one call per file.
+CREATE INDEX IF NOT EXISTS idx_matches_b ON matches(b_path);
+
+-- Incremental Pass-2: every candidate pair ALIGNED in a scan is recorded here (match OR DIFFERENT),
+-- so a later scan skips re-aligning it. DIFFERENT verdicts aren't kept in `matches`, so without this
+-- ledger a re-run re-aligns all ~millions of (mostly-DIFFERENT) pairs from scratch. `fingerprint`
+-- (feature_version + thresholds) invalidates the row when the algorithm or θ changes; a re-analyzed
+-- file's pairs are bypassed by the scan (its content changed). pair_hash = blake2b(canonical a\0b).
+CREATE TABLE IF NOT EXISTS evaluated_pairs (
+    pair_hash   TEXT PRIMARY KEY,
+    fingerprint TEXT NOT NULL
+);
+
 -- Full-scan clusters (materialized union-find).
 CREATE TABLE IF NOT EXISTS clusters (
     cluster_id     INTEGER NOT NULL,
@@ -75,6 +90,11 @@ CREATE TABLE IF NOT EXISTS clusters (
 CREATE TABLE IF NOT EXISTS problems (
     path        TEXT PRIMARY KEY,
     error       TEXT,
+    -- mtime+size at the time of failure: a file already attempted and UNCHANGED is skipped on the
+    -- next scan/sweep (don't re-decode a known-corrupt file every cycle). A re-download/remux changes
+    -- these -> the guard lifts and it's retried.
+    mtime       REAL,
+    size        INTEGER,
     category    TEXT NOT NULL DEFAULT 'corrupt',
     -- repair_note: result of the LAST remux attempt (NULL if not yet attempted).
     -- When present it is the "why" the UI shows instead of the scan error
