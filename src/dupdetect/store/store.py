@@ -85,6 +85,16 @@ class FingerprintStore:
             self.conn.execute("ALTER TABLE files ADD COLUMN color_stats BLOB")
         except sqlite3.OperationalError:
             pass                                   # already exists
+        # One-time v2-probe rollout (audio coverage): rows the v1 probe FLAGGED lose their cached
+        # value and re-measure lazily with the v2 probe (5s windows, all audio streams) — the false
+        # positives live below the threshold by definition. Rows above it keep their cache. Keyed by
+        # PRAGMA user_version so a legitimately-low v2 measurement is never re-NULLed on reopen.
+        # Deliberately NOT a COVERAGE_VERSION bump: that lives inside feature_version and would force
+        # a full re-decode+embed of the library for an audio-only change.
+        if self.conn.execute("PRAGMA user_version").fetchone()[0] < 1:
+            self.conn.execute("UPDATE files SET audio_coverage=NULL WHERE audio_coverage < ?",
+                              (AUDIO_OK_COVERAGE,))
+            self.conn.execute("PRAGMA user_version = 1")
         self.conn.commit()
         self._reclassify_stale_problems()
 
@@ -276,12 +286,66 @@ class FingerprintStore:
     def audio_warnings(self, threshold: float = AUDIO_OK_COVERAGE) -> list[tuple[str, float, float]]:
         """(path, audio_coverage, duration_s) for files with missing/truncated audio (coverage
         < `threshold`). For the 'Quality warnings' tab and to avoid losing the copy with audio in
-        a deletion. Legacy records (audio_coverage NULL) do NOT appear -> re-scan to measure them."""
-        return [(r["path"], r["audio_coverage"], r["duration_s"] or 0.0)
+        a deletion. Legacy records (audio_coverage NULL) do NOT appear -> re-scan to measure them.
+        Files with a VALID user override ('Mark audio as OK') are excluded — the user already
+        verified them; the measured value stays stored (restore = drop the override)."""
+        rows = [(r["path"], r["audio_coverage"], r["duration_s"] or 0.0)
                 for r in self.conn.execute(
                     "SELECT path, audio_coverage, duration_s FROM files "
                     "WHERE audio_coverage IS NOT NULL AND audio_coverage < ? "
                     "ORDER BY audio_coverage", (threshold,))]
+        overridden = self.quality_overridden_paths("audio")
+        return [t for t in rows if t[0] not in overridden]
+
+    # ---- per-file quality overrides ("Mark audio as OK") ------------------
+    def set_quality_override(self, path: str, kind: str = "audio") -> bool:
+        """User correction of a FALSE quality warning (e.g. genuinely quiet content the probe reads
+        as 'no audio'). Stamps the file's mtime+size so the override AUTO-EXPIRES when the file
+        changes (a truly muted re-download must warn again — the problems.mtime/size pattern).
+        Steers warnings and KEEP only, never a verdict (§0: audio_coverage does not enter
+        decide_tree). Returns False when the file can't be statted (an override stamps a real file)."""
+        try:
+            st = os.stat(path)
+        except OSError:
+            return False
+        self.conn.execute(
+            """INSERT INTO quality_overrides (path, kind, mtime, size, created_at)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(path, kind) DO UPDATE SET
+                   mtime=excluded.mtime, size=excluded.size, created_at=excluded.created_at""",
+            (str(path), kind, st.st_mtime, st.st_size, time.time()))
+        self.conn.commit()
+        return True
+
+    def clear_quality_override(self, path: str, kind: str = "audio") -> None:
+        """Drops the override -> the MEASURED value (still stored in files.audio_coverage) rules
+        again. Also the first step of a re-check: a fresh measurement supersedes the user's mark."""
+        self.conn.execute("DELETE FROM quality_overrides WHERE path=? AND kind=?",
+                          (str(path), kind))
+        self.conn.commit()
+
+    def _override_valid(self, row, path: str) -> bool:
+        """An override counts only while the file is UNCHANGED since it was set (same mtime+size,
+        within the store's tolerance). Changed or unstattable -> expired (fail-safe: warn again)."""
+        try:
+            st = os.stat(path)
+        except OSError:
+            return False
+        return abs(row["mtime"] - st.st_mtime) <= self.mtime_tol and row["size"] == st.st_size
+
+    def has_quality_override(self, path: str, kind: str = "audio") -> bool:
+        """True iff a currently-VALID override exists for `path` (see _override_valid)."""
+        row = self.conn.execute(
+            "SELECT mtime, size FROM quality_overrides WHERE path=? AND kind=?",
+            (str(path), kind)).fetchone()
+        return row is not None and self._override_valid(row, str(path))
+
+    def quality_overridden_paths(self, kind: str = "audio") -> set[str]:
+        """Paths with a currently-VALID override. O(overrides) stats — the table holds only the
+        files the user marked, not the library."""
+        return {r["path"] for r in self.conn.execute(
+                    "SELECT path, mtime, size FROM quality_overrides WHERE kind=?", (kind,))
+                if self._override_valid(r, r["path"])}
 
     def prune_missing_problems(self, *, exists=os.path.exists, isdir=os.path.isdir,
                                ismount=None) -> int:
@@ -621,6 +685,7 @@ class FingerprintStore:
         self.conn.execute("DELETE FROM files WHERE path=?", (str(path),))
         self.conn.execute("DELETE FROM matches WHERE a_path=? OR b_path=?", (str(path), str(path)))
         self.conn.execute("DELETE FROM clusters WHERE path=?", (str(path),))
+        self.conn.execute("DELETE FROM quality_overrides WHERE path=?", (str(path),))
         if commit:
             self.conn.commit()
         return row is not None

@@ -119,20 +119,32 @@ def extract_cpu_features(path: str, independent_scenes: bool = False) -> CpuFeat
 
 
 def ensure_audio_coverage(path: str, store: FingerprintStore, duration_s: float,
-                          has_audio: bool, n_points: int = 40) -> float:
+                          has_audio: bool, n_points: int | None = None,
+                          force: bool = False) -> float:
     """ON-DEMAND whole-file audio coverage (muted/truncated-copy signal). Computed-if-missing and
     persisted, mirroring the audio-fp pattern: NULL in the DB = not computed yet. Checks the RAW
     column (not the NULL->1.0 loaded value) so 'already computed as 1.0' and 'not computed' don't
     collapse. Used by rank_cluster (cluster members) and by the Deep depth (all files).
 
-    `n_points`: how many positions to seek-sample. The KEEP muted-check (rank_cluster) passes a small
-    value — detecting a muted/silent copy needs far fewer probes than precise coverage, and on a
-    spinning HDD each probe is a seek (40 points on a 44GB file measured ~28s vs ~3s at 8). The Deep
-    'coverage for ALL files' path keeps the default (40) for precise truncation reporting. Cached, so
-    a value computed once (at any granularity) is reused — re-runs never recompute."""
-    row = store.conn.execute("SELECT audio_coverage FROM files WHERE path=?", (str(path),)).fetchone()
-    if row is not None and row[0] is not None:
-        return float(row[0])                         # already computed -> reuse (incremental)
+    USER OVERRIDE first ('Mark audio as OK'): a valid override returns 1.0 WITHOUT persisting it —
+    files.audio_coverage keeps the measured value so 'restore measured' is just dropping the
+    override. This is the pipeline's single chokepoint, so the KEEP muted-check, the color-keep
+    guard and the rank evidence all see the override without knowing it exists. Steers KEEP and
+    warnings only — audio_coverage never enters decide_tree (§0).
+
+    `n_points`: how many positions to seek-sample; None -> duration-scaled (coverage_points, one
+    probe per ~2 min clamped). The KEEP muted-check (rank_cluster) passes a small value — spotting
+    a muted copy needs far fewer probes than precise coverage, and on a spinning HDD each probe is
+    a seek (40 points on a 44GB file measured ~28s vs ~3s at 8). Cached, so a value computed once
+    (at any granularity) is reused — re-runs never recompute. `force=True` (the UI's '↻ Re-check
+    audio') skips the cache and OVERWRITES it with a fresh full-density measurement."""
+    if store.has_quality_override(str(path), "audio"):
+        return 1.0                                   # user verified it -> clean, but keep the measurement
+    if not force:
+        row = store.conn.execute("SELECT audio_coverage FROM files WHERE path=?",
+                                 (str(path),)).fetchone()
+        if row is not None and row[0] is not None:
+            return float(row[0])                     # already computed -> reuse (incremental)
     cov = scan_audio_coverage(path, duration_s, n_points=n_points) if has_audio else 0.0
     store.set_audio_coverage(str(path), cov)
     return cov

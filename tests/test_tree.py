@@ -130,3 +130,18 @@ def test_different_edition_is_not_duplicate(th):
                     extra_ratio=0.15)
     r = decide_tree(a, b, AlignResult(0.2), v, AlignResult(0.5), th)
     assert r.verdict == Verdict.DIFFERENT_EDITION
+
+
+def test_verdict_invariant_to_quality_audio_coverage(th):
+    """§0: quality.audio_coverage steers KEEP selection and warnings ONLY — the verdict tree must
+    be bit-identical whatever the coverage says (an audio-quality override can never flip a verdict)."""
+    from dupdetect.models import Quality
+    for cov_a, cov_b in ((1.0, 1.0), (0.0, 1.0), (None, 0.3)):
+        a, b = _rec("a", "x"), _rec("b", "y")
+        a.quality = Quality(audio_coverage=cov_a)
+        b.quality = Quality(audio_coverage=cov_b)
+        r = decide_tree(a, b, AlignResult(0.9), AlignResult(0.9, coverage=0.9),
+                        AlignResult(0.5), th)
+        assert r.verdict == Verdict.CERTAIN and "T1" in r.reason
+        r2 = decide_tree(a, b, AlignResult(0.0), AlignResult(0.0), AlignResult(0.0), th)
+        assert r2.verdict == Verdict.DIFFERENT

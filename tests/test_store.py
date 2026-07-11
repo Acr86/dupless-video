@@ -228,3 +228,74 @@ def test_all_global_vecs_skips_lite_records(store):
     paths, vecs = store.all_global_vecs()            # would TypeError on np.frombuffer(None) before
     assert paths == ["/full.mkv"]                    # only the full record, LITE skipped
     assert vecs.shape == (1, 8)
+
+
+# ----------------------------------------------------- quality overrides ("Mark audio as OK")
+
+def _flagged_file(store, tmp_path, name: str):
+    """A real on-disk file, indexed and MEASURED below the audio threshold (shows as a warning)."""
+    f = tmp_path / name
+    f.write_bytes(b"x" * 100)
+    p = str(f)
+    store.save(_rec(p), feature_version=FV)
+    store.set_audio_coverage(p, 0.2)
+    return f, p
+
+
+def test_quality_override_hides_warning_and_is_revertible(store, tmp_path):
+    """'Mark audio as OK': the warning disappears but the MEASURED value stays stored, so
+    'restore' is just dropping the override — no data is lost."""
+    _f, p = _flagged_file(store, tmp_path, "quiet.mkv")
+    assert [w[0] for w in store.audio_warnings()] == [p]
+    assert store.set_quality_override(p) is True
+    assert store.has_quality_override(p)
+    assert store.audio_warnings() == []                            # hidden while overridden
+    got = store.conn.execute("SELECT audio_coverage FROM files WHERE path=?", (p,)).fetchone()[0]
+    assert got == 0.2                                              # measurement untouched
+    store.clear_quality_override(p)
+    assert not store.has_quality_override(p)
+    assert [w[0] for w in store.audio_warnings()] == [p]           # measured value rules again
+
+
+def test_quality_override_expires_when_file_changes(store, tmp_path):
+    """The override stamps mtime+size: a changed file (truly muted re-download) EXPIRES it and
+    the warning comes back — fail-safe, the user is warned again."""
+    f, p = _flagged_file(store, tmp_path, "q2.mkv")
+    store.set_quality_override(p)
+    assert store.has_quality_override(p) and store.audio_warnings() == []
+    f.write_bytes(b"y" * 999)                                      # size (and mtime) change
+    assert not store.has_quality_override(p)
+    assert [w[0] for w in store.audio_warnings()] == [p]
+
+
+def test_quality_override_needs_real_file_and_dies_with_it(store, tmp_path):
+    """An override stamps a real file (unstattable -> no row) and is removed by forget_file."""
+    assert store.set_quality_override(str(tmp_path / "ghost.mkv")) is False
+    _f, p = _flagged_file(store, tmp_path, "q3.mkv")
+    store.set_quality_override(p)
+    store.forget_file(p)
+    assert store.conn.execute("SELECT COUNT(*) FROM quality_overrides").fetchone()[0] == 0
+
+
+def test_coverage_v2_migration_nulls_only_flagged_once(tmp_path):
+    """v2-probe rollout: reopening a pre-v2 DB NULLs ONLY the rows the v1 probe FLAGGED (they
+    re-measure lazily with v2); clean caches are kept, and the user_version marker guarantees a
+    legitimately-low v2 value is never re-NULLed on a later reopen."""
+    db = tmp_path / "mig.sqlite"
+    s = FingerprintStore(db)
+    for p, cov in (("/lib/ok.mkv", 0.95), ("/lib/flagged.mkv", 0.30)):
+        s.save(_rec(p), feature_version=FV)
+        s.set_audio_coverage(p, cov)
+    s.conn.execute("PRAGMA user_version = 0")                      # simulate a pre-v2 DB
+    s.conn.commit()
+    s.close()
+    s2 = FingerprintStore(db)                                      # reopen -> migration runs
+    rows = dict(s2.conn.execute("SELECT path, audio_coverage FROM files"))
+    assert rows["/lib/ok.mkv"] == 0.95                             # clean cache kept
+    assert rows["/lib/flagged.mkv"] is None                        # flagged -> re-measure with v2
+    s2.set_audio_coverage("/lib/flagged.mkv", 0.30)                # a legit LOW v2 measurement...
+    s2.close()
+    s3 = FingerprintStore(db)                                      # ...survives the next reopen
+    assert s3.conn.execute("SELECT audio_coverage FROM files WHERE path=?",
+                           ("/lib/flagged.mkv",)).fetchone()[0] == 0.30
+    s3.close()

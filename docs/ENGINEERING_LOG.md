@@ -11,6 +11,49 @@ Newest on top. Append-only in spirit. Deep rationale for the design invariants l
 
 ## Entries
 
+### Healthy files flagged "NO AUDIO / audio truncated" (false quality warnings) — probe v2 + user fixes
+- **Symptom:** files that play fine (audio present) show in Quality warnings / carry the per-copy ⚠,
+  blocking auto-KEEP on their clusters; nothing in the UI could correct it (the tab was triage-only)
+  and the cached value never re-measured (only a global force re-scan reset it).
+- **Root cause (three failure modes in `scan_audio_coverage` v1):** (1) 0.5s `volumedetect` windows —
+  a dialogue pause / quiet ambient scene averages < −60 dB and counts as "no audio"; with the KEEP
+  muted-check's 12 points, TWO genuinely quiet windows flag a healthy film. (2) Only the FIRST audio
+  stream was probed (`-map 0:a:0?`): a commentary/low-level track 0 false-flags a file whose real
+  audio is on track 1. (3) Fixed 40 points over-probes shorts and under-probes 3h movies. Plus:
+  coverage is computed once and cached forever (NULL = not computed), with no targeted re-measure
+  and no per-file correction.
+- **Resolution:** probe v2 + two user-facing fixes; thresholds NOT loosened (§0 spirit), and
+  audio_coverage never enters `decide_tree` (verified + regression test), so verdicts are untouched.
+  1. **Probe v2** (`scan_audio_coverage`): 5s windows (averages across pauses; cost is SEEK-dominated
+     so decoding 5s vs 0.5s is ~free, §1), duration-scaled density (`coverage_points`: one probe per
+     ~2 min, clamp [8,48] — deterministic, §0), and ALL audio streams in one pass (`-map 0:a?` emits
+     one `mean_volume` PER stream — verified against the bundled ffmpeg with a 2-track file; any
+     stream above −60 dB counts). Genre-adaptivity was deliberately NOT content-based (measure,
+     don't classify): wide windows + scaled density absorb the variance; the residue is what the
+     manual override is for.
+  2. **Rollout without re-decode:** `COVERAGE_VERSION` NOT bumped (it lives inside feature_version →
+     would re-decode+embed the whole library). Instead a one-shot `PRAGMA user_version`-keyed
+     migration NULLs ONLY the rows the v1 probe flagged (< 0.85) → they lazily re-measure with v2;
+     clean caches survive, and a legitimately-low v2 value is never re-NULLed on reopen.
+  3. **'↻ Re-check audio'** (Quality tab + duplicates-tree context menu): re-measures with full v2
+     density and OVERWRITES the cache (`ensure_audio_coverage(force=True)`), off the GUI thread
+     (`_AudioFixWorker(QThread)`, own store handle). **'✓ Mark audio as OK'**: per-file override in
+     the new `quality_overrides` table, stamped with mtime+size so it AUTO-EXPIRES when the file
+     changes (a truly muted re-download warns again); revertible ("Restore measured value" — the
+     measured `files.audio_coverage` is never rewritten). Consumed at exactly three read points:
+     `ensure_audio_coverage` (pipeline: KEEP muted-check, color-keep guard, rank evidence),
+     `audio_warnings` (tab), `load_clusters` (audio_bad/audio_warning/is_actionable coalesce).
+     After a fix, the TOUCHED clusters re-rank via the reuse-snapshot-minus-affected pattern
+     (`_rebuild_clusters(reuse=…)`) so a stale "⚠ NO AUDIO" in the persisted rank_reason regenerates.
+- **Files / refs:** `features/audio_fp.py` (`coverage_points`, `COVERAGE_WIN_S`, v2 probe);
+  `store.py`/`schema.sql` (`quality_overrides`, `set/clear/has_quality_override`,
+  `quality_overridden_paths`, user_version migration, `audio_warnings` filter, `forget_file`);
+  `pipeline/analyze.py` (`ensure_audio_coverage` override/force); `ui/data.py` (`load_clusters`),
+  `ui/model.py` (`AUDIO_BAD_ROLE`), `ui/main.py` (`_AudioFixWorker`, `_audio_fix`, tab buttons,
+  context menu). Tests in `test_audio.py`, `test_store.py`, `test_pipeline.py`, `test_tree.py`
+  (§0 invariance), `test_ui.py` (worker end-to-end + coalesce).
+- **Scope:** decided 2026-07-06.
+
 ### Review sweep: Problems-tab ghosts (Mode B), POSIX prune was a silent no-op, M4 move-clone, UI prune off the GUI thread
 - **Symptom:** a code review of the file-existence reconciliation found residual holes after the
   2026-06-21 fix: (a) the Problems tab kept ghost rows for files whose whole FOLDER was deleted;

@@ -290,3 +290,46 @@ def test_fft_align_audio_matches_bruteforce_random(rng):
         assert r.offset == ref[1] / ITEM_RATE_HZ
         assert abs(r.coverage - ref[2]) < 1e-12
         assert abs(r.score - ref[0]) < 1e-9
+
+
+# ----------------------------------------------------- coverage probe v2 (duration-scaled, all streams)
+
+def test_coverage_points_duration_scaled():
+    """One probe per ~2 min of runtime, clamped [8,48] — a pure function of the duration (§0:
+    deterministic probe positions, no RNG)."""
+    assert afp.coverage_points(0) == 8
+    assert afp.coverage_points(600) == 8                 # 10 min -> floor
+    assert afp.coverage_points(1800) == 15               # 30 min
+    assert afp.coverage_points(5400) == 45               # 90 min
+    assert afp.coverage_points(4 * 3600) == 48           # 4 h -> cap
+    pts = [afp.coverage_points(d) for d in range(0, 20000, 500)]
+    assert pts == sorted(pts)                            # never fewer probes for longer content
+
+
+def test_scan_audio_coverage_any_stream_with_audio_counts(monkeypatch):
+    """v2 probes ALL audio streams in one pass (-map 0:a? -> one mean_volume line PER stream):
+    track 0 silent (commentary/empty) + track 1 with real audio -> the probe HAS audio. The v1
+    first-stream-only probe (0:a:0?) false-flagged exactly these files."""
+    seen = {"cmd": None}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        return _cp(0, "", "mean_volume: -inf dB\nmean_volume: -30.0 dB")
+
+    monkeypatch.setattr(afp.subprocess, "run", fake_run)
+    assert afp.scan_audio_coverage("x.mkv", duration_s=3600, n_points=10) == 1.0
+    assert "0:a?" in seen["cmd"]                         # all streams, not just the first
+    assert str(afp.COVERAGE_WIN_S) in seen["cmd"]        # 5s window (0.5s fell in dialogue pauses)
+
+
+def test_scan_audio_coverage_default_points_follow_duration(monkeypatch):
+    """n_points=None -> coverage_points(duration): a 30-min file runs exactly 15 probes."""
+    calls = {"n": 0}
+
+    def fake_run(cmd, **kw):
+        calls["n"] += 1
+        return _cp(0, "", "mean_volume: -30.0 dB")
+
+    monkeypatch.setattr(afp.subprocess, "run", fake_run)
+    assert afp.scan_audio_coverage("x.mkv", duration_s=1800) == 1.0
+    assert calls["n"] == afp.coverage_points(1800) == 15

@@ -22,8 +22,8 @@ from dupdetect import __version__
 from dupdetect.ui import actions, startup
 from dupdetect.ui.data import clean_title, drift_report, is_actionable, load_clusters, sort_clusters
 from dupdetect.ui.model import (
-    KIND_ROLE, PATH_ROLE, build_audio_warning_model, build_model, build_problem_model,
-    checked_files, checked_problems, problem_paths, remove_paths,
+    AUDIO_BAD_ROLE, KIND_ROLE, PATH_ROLE, build_audio_warning_model, build_model,
+    build_problem_model, checked_files, checked_problems, problem_paths, remove_paths,
 )
 from dupdetect.ui.scan_panel import ScanPanel
 from dupdetect.ui.watch_panel import WatchPanel
@@ -77,6 +77,58 @@ class _PruneWorker(QThread):
         self.done.emit(n)
 
 
+class _AudioFixWorker(QThread):
+    """Audio-quality corrections OFF the GUI thread (same shape as _PruneWorker: own store handle,
+    SQLite is per-thread, WAL lets it write while the GUI reads). Modes:
+      'recheck'  — drop any user override (a fresh measurement supersedes it) and re-measure with
+                   the full-precision v2 probe (duration-scaled points, all audio streams),
+                   OVERWRITING the cached files.audio_coverage. Each probe is a disk seek, so a
+                   multi-file re-check would freeze the window if run on the GUI thread.
+      'override' — 'Mark audio as OK': persist the user's verification (auto-expires on file change).
+      'restore'  — drop the override; the measured value rules again.
+    Afterwards, clusters whose members were touched re-rank (their persisted rank_reason may carry
+    a stale '⚠ NO AUDIO'): the reuse-snapshot minus the affected signatures makes _rebuild_clusters
+    re-rank ONLY those (the reconcile_removals pattern). Failures are printed, never raised (§2)."""
+    progress = Signal(int, int)                          # (done, total)
+    done = Signal(int)                                   # files actually processed
+
+    def __init__(self, db_path: str, mode: str, paths: list[str], parent=None):
+        super().__init__(parent)
+        self._db, self._mode, self._paths = db_path, mode, list(paths)
+
+    def run(self):
+        n = 0
+        try:
+            from dupdetect.config import load_thresholds
+            from dupdetect.pipeline.analyze import ensure_audio_coverage
+            from dupdetect.pipeline.fullscan import _rebuild_clusters, _snapshot_clusters
+            store = FingerprintStore(self._db)
+            try:
+                prior = _snapshot_clusters(store)        # reuse ranking of untouched clusters
+                touched = {sig for sig in prior if any(p in sig for p in self._paths)}
+                for i, p in enumerate(self._paths, 1):
+                    self.progress.emit(i, len(self._paths))
+                    if self._mode == "override":
+                        store.set_quality_override(p)
+                    elif self._mode == "restore":
+                        store.clear_quality_override(p)
+                    else:                                # 'recheck'
+                        store.clear_quality_override(p)  # fresh measurement supersedes the user mark
+                        rec = store.load(p, with_embeddings=False)
+                        if rec is not None:
+                            ensure_audio_coverage(p, store, rec.probe.duration_s,
+                                                  bool(rec.probe.audio_tracks), force=True)
+                    n += 1
+                if touched:                              # only the affected clusters re-rank
+                    reuse = {sig: v for sig, v in prior.items() if sig not in touched}
+                    _rebuild_clusters(store, load_thresholds(), reuse=reuse)
+            finally:
+                store.close()
+        except Exception as e:                           # noqa: BLE001 — a fix must not break the UI
+            print(f"[ui] audio fix ({self._mode}) failed ({e!r})", flush=True)
+        self.done.emit(n)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, db_path: str):
         super().__init__()
@@ -86,6 +138,7 @@ class MainWindow(QMainWindow):
         self._hdr_ready: set = set()                    # trees whose header already has defaults applied
         self._persisted: set = set()                    # trees restored from a previous session
         self._prune_worker: _PruneWorker | None = None  # background disk reconcile (one at a time)
+        self._audio_worker: _AudioFixWorker | None = None   # background audio re-check/override
         self.setWindowTitle(f"Dupless Video · Duplicates — {db_path}")
         _icon = Path(__file__).with_name("icon.ico")
         if _icon.exists():
@@ -241,14 +294,31 @@ class MainWindow(QMainWindow):
         aw_google.clicked.connect(lambda: self._google_checked(self.audio_model))
         aw_export = QPushButton("📤 Export")
         aw_export.clicked.connect(lambda: self._export_problem("audio"))
+        # False-positive fixes: RE-MEASURE (full-precision probe overwrites the cached value) or
+        # MARK AS OK (persisted user verification; auto-expires if the file changes).
+        aw_recheck = QPushButton("↻ Re-check audio")
+        aw_recheck.setToolTip("Re-measure the checked files with the full-precision probe (all audio "
+                              "streams, wide windows) and overwrite the cached value. Use when the "
+                              "warning looks wrong — quiet scenes or a commentary-first track can "
+                              "fool the quick scan.")
+        aw_recheck.clicked.connect(lambda: self._audio_fix(
+            "recheck", self._checked_problem_paths(self.audio_model)))
+        aw_mark = QPushButton("✓ Mark audio as OK")
+        aw_mark.setToolTip("You verified in VLC that the audio is fine (e.g. genuinely quiet "
+                           "content): hide this warning. It re-appears automatically if the file "
+                           "changes on disk.")
+        aw_mark.clicked.connect(lambda: self._audio_fix(
+            "override", self._checked_problem_paths(self.audio_model)))
+        self._aw_fix_buttons = (aw_recheck, aw_mark)    # disabled while a fix worker runs
         aw_tab = QWidget(); aw_lay = QVBoxLayout(aw_tab)
         aw_lay.addWidget(QLabel(
             "⚠ Audio quality: these videos play fine but a copy has NO audio or the audio is "
             "cut/corrupted from some point on. NOT deleted and NOT auto-kept — verify in VLC and "
-            "decide which copy to keep, so you don't end up keeping the muted one."))
+            "decide which copy to keep, so you don't end up keeping the muted one. False alarm "
+            "(quiet movie, wrong track measured)? ↻ Re-check re-measures; ✓ Mark as OK hides it."))
         aw_lay.addWidget(self.audio_tree)
         aw_bar = QHBoxLayout(); aw_bar.addWidget(self.aw_sel); aw_bar.addStretch(1)
-        for b in (aw_google, aw_export, aw_vlc, aw_open):
+        for b in (aw_google, aw_export, aw_vlc, aw_open, aw_recheck, aw_mark):
             aw_bar.addWidget(b)
         aw_lay.addLayout(aw_bar)
 
@@ -725,6 +795,15 @@ class MainWindow(QMainWindow):
             a.setEnabled(not is_master)
             if is_master:
                 a.setToolTip("Labels the COPY, not the ★ (master). Right-click on a copy.")
+        # Audio-warning fixes, on the file that carries the ⚠ (same actions as the Quality tab).
+        a_recheck = a_mark = a_restore = None
+        if self.store.has_quality_override(path):
+            menu.addSeparator()
+            a_restore = menu.addAction("↺ Restore measured audio value")
+        elif it.data(AUDIO_BAD_ROLE):
+            menu.addSeparator()
+            a_recheck = menu.addAction("↻ Re-check audio")
+            a_mark = menu.addAction("✓ Mark audio as OK (verified)")
         act = menu.exec(self.tree.viewport().mapToGlobal(pos))
         if act is a_master and cid is not None:
             self.store.set_keep(int(cid), path)                     # moves the ★; others become selectable
@@ -736,6 +815,35 @@ class MainWindow(QMainWindow):
             self.store.save_feedback(keep, path, "different" if act is a_diff else "same")
             self.statusBar().showMessage(
                 f"Feedback saved ({'not-dup' if act is a_diff else 'dup'}). Use ⚙ Recalibrate to apply.", 5000)
+        elif act is not None and act is a_restore:
+            self._audio_fix("restore", [path])
+        elif act is not None and act is a_recheck:
+            self._audio_fix("recheck", [path])
+        elif act is not None and act is a_mark:
+            self._audio_fix("override", [path])
+
+    def _audio_fix(self, mode: str, paths: list[str]) -> None:
+        """Dispatch an audio-quality correction ('recheck' | 'override' | 'restore') to the
+        background worker (_AudioFixWorker). One at a time; empty selection -> tell the user."""
+        if not paths:
+            _mbox(self, "Nothing selected", "Check at least one file first.")
+            return
+        if self._audio_worker is not None and self._audio_worker.isRunning():
+            self.statusBar().showMessage("An audio re-check is already running…", 4000)
+            return
+        for b in self._aw_fix_buttons:
+            b.setEnabled(False)
+        self._audio_worker = _AudioFixWorker(self._db_path, mode, paths, parent=self)
+        self._audio_worker.progress.connect(
+            lambda i, t: self.statusBar().showMessage(f"Audio check {i}/{t}…", 0))
+        self._audio_worker.done.connect(self._on_audio_fix_done)
+        self._audio_worker.start()
+
+    def _on_audio_fix_done(self, n: int):
+        for b in self._aw_fix_buttons:
+            b.setEnabled(True)
+        self.refresh()                                   # warnings/tab counter/cluster ⚠ re-derive
+        self._toast(f"Audio: {n} file(s) updated.")
 
     def _cluster_keep(self, file_item):
         parent = file_item.parent()

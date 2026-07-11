@@ -124,7 +124,10 @@ class ClusterRow:
 
 def load_clusters(store: FingerprintStore) -> list[ClusterRow]:
     """Rebuilds clusters for the view from the DB: `clusters` ⋈ `files`, with the
-    representative verdict from `matches` (strongest among members)."""
+    representative verdict from `matches` (strongest among members). A valid 'Mark audio as OK'
+    override coalesces the member's coverage to 1.0 at LOAD time — audio_bad, audio_warning,
+    is_actionable and every tooltip then follow without knowing overrides exist."""
+    overridden = store.quality_overridden_paths("audio")
     files = {r["path"]: r for r in store.conn.execute(
         "SELECT path, height, width, bitrate_kbps, size, vcodec, lang_detected, "
         "audio_coverage, color_stats FROM files")}
@@ -133,6 +136,7 @@ def load_clusters(store: FingerprintStore) -> list[ClusterRow]:
         cid = r["cluster_id"]
         cl = grouped.setdefault(cid, ClusterRow(cluster_id=cid))
         f = files.get(r["path"])
+        cov = f["audio_coverage"] if f and f["audio_coverage"] is not None else 1.0
         cl.members.append(FileRow(
             path=r["path"],
             height=(f["height"] if f else 0) or 0,
@@ -142,7 +146,7 @@ def load_clusters(store: FingerprintStore) -> list[ClusterRow]:
             vcodec=(f["vcodec"] if f else "") or "",
             lang=(f["lang_detected"] if f else "") or "",
             is_keep=bool(r["is_keep"]),
-            audio_coverage=(f["audio_coverage"] if f and f["audio_coverage"] is not None else 1.0),
+            audio_coverage=1.0 if r["path"] in overridden else cov,
             color=ColorStats.from_list(
                 np.frombuffer(f["color_stats"], np.float32) if f and f["color_stats"] else None),
         ))

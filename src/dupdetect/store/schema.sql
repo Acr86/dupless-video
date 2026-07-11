@@ -122,3 +122,17 @@ CREATE TABLE IF NOT EXISTS deletions (
     size        INTEGER,
     deleted_at  REAL NOT NULL
 );
+
+-- Per-FILE user corrections of a FALSE quality warning ("Mark audio as OK"): the probe read
+-- genuinely quiet content as missing audio. Separate table (not a files column: save()'s UPSERT
+-- would clobber it on re-analysis). mtime+size stamp the file at override time so the override
+-- AUTO-EXPIRES when the file changes (a truly muted re-download must warn again). Steers warnings
+-- and KEEP only — audio_coverage never enters the verdict tree (§0).
+CREATE TABLE IF NOT EXISTS quality_overrides (
+    path        TEXT NOT NULL,
+    kind        TEXT NOT NULL,         -- 'audio' today; extensible (color, cam, ...)
+    mtime       REAL NOT NULL,
+    size        INTEGER NOT NULL,
+    created_at  REAL NOT NULL,
+    PRIMARY KEY (path, kind)
+);

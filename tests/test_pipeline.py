@@ -438,3 +438,44 @@ def test_record_from_donor_requires_size_and_embeddings(tmp_path):
     store.conn.commit()
     assert analyze.record_from_donor(cpu(donor.size), store, fv) is None
     store.close()
+
+
+# --------------------------------------------------------------- ensure_audio_coverage (override/force)
+
+def test_ensure_audio_coverage_override_short_circuits_without_persisting(tmp_path, monkeypatch):
+    """A valid 'audio OK' override returns 1.0 from the pipeline chokepoint WITHOUT running the
+    probe and WITHOUT touching the stored measurement (restore = drop the override)."""
+    from dupdetect.pipeline import analyze
+    store = FingerprintStore(tmp_path / "cov.sqlite")
+    f = tmp_path / "m.mkv"
+    f.write_bytes(b"x")
+    p = str(f)
+    store.save(_donor_rec(p), feature_version="fv")
+    store.set_audio_coverage(p, 0.2)                     # measured: flagged
+    store.set_quality_override(p)
+    monkeypatch.setattr(analyze, "scan_audio_coverage",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not probe")))
+    assert analyze.ensure_audio_coverage(p, store, 100.0, True) == 1.0
+    got = store.conn.execute("SELECT audio_coverage FROM files WHERE path=?", (p,)).fetchone()[0]
+    assert got == 0.2                                    # measurement untouched
+    store.close()
+
+
+def test_ensure_audio_coverage_force_overwrites_cache(tmp_path, monkeypatch):
+    """force=True (the UI '↻ Re-check audio') skips the cached value and OVERWRITES it with a
+    fresh measurement; subsequent calls reuse the new cache."""
+    from dupdetect.pipeline import analyze
+    store = FingerprintStore(tmp_path / "cov2.sqlite")
+    f = tmp_path / "m2.mkv"
+    f.write_bytes(b"x")
+    p = str(f)
+    store.save(_donor_rec(p), feature_version="fv")
+    store.set_audio_coverage(p, 0.2)                     # stale v1 false positive
+    monkeypatch.setattr(analyze, "scan_audio_coverage", lambda *a, **k: 0.97)
+    assert analyze.ensure_audio_coverage(p, store, 100.0, True, force=True) == 0.97
+    got = store.conn.execute("SELECT audio_coverage FROM files WHERE path=?", (p,)).fetchone()[0]
+    assert got == 0.97                                   # cache overwritten
+    monkeypatch.setattr(analyze, "scan_audio_coverage",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("cached")))
+    assert analyze.ensure_audio_coverage(p, store, 100.0, True) == 0.97   # reused, no re-probe
+    store.close()

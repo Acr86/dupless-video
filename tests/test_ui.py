@@ -782,3 +782,64 @@ def test_route_event_canonicalizes_watchdog_paths():
     _route_event(_Ev(), None, changed)
     assert list(changed) == [canonical_path(canon)]
     assert "/" not in changed[0]
+
+
+# ----------------------------------------------------- audio false-positive fixes (override / re-check)
+
+def test_load_clusters_coalesces_override_to_clean(store, tmp_path):
+    """A valid 'Mark audio as OK' reads as clean at LOAD time: audio_bad/audio_warning switch off
+    and the cluster becomes actionable again — every consumer follows without knowing overrides."""
+    f = tmp_path / "ovr.mkv"
+    f.write_bytes(b"x")
+    p = str(f)
+    store.save(_rec(p, h=2160, audio_cov=0.0), feature_version="fv")      # measured: muted (false)
+    store.save(_rec("/other.mkv", h=1080, audio_cov=1.0), feature_version="fv")
+    store.save_cluster(0, p, is_keep=1)
+    store.save_cluster(0, "/other.mkv", is_keep=0)
+    store.save_match(p, "/other.mkv", "CERTAIN", 0.99, "T1")
+    (cl,) = load_clusters(store)
+    assert cl.audio_warning and not is_actionable(cl)                     # coverages differ -> review
+    store.set_quality_override(p)
+    (cl2,) = load_clusters(store)
+    assert not cl2.audio_warning and is_actionable(cl2)                   # overridden -> actionable
+    assert all(not m.audio_bad for m in cl2.members)
+
+
+def test_audio_fix_worker_override_updates_db_and_reranks(tmp_path, monkeypatch):
+    """_AudioFixWorker end-to-end (run() called synchronously — no thread/event loop): 'override'
+    persists the mark, the file leaves audio_warnings, and the TOUCHED cluster re-ranks so its
+    persisted rank_reason drops the stale '⚠ NO AUDIO' and the 4K copy wins KEEP again."""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+
+    QApplication.instance() or QApplication([])
+    from dupdetect.config import load_thresholds
+    from dupdetect.pipeline.fullscan import _rebuild_clusters
+    from dupdetect.ui.main import _AudioFixWorker
+
+    db = tmp_path / "afix.sqlite"
+    st = FingerprintStore(db)
+    hi = tmp_path / "hi4k.mkv"
+    hi.write_bytes(b"h")
+    lo = tmp_path / "lo1080.mkv"
+    lo.write_bytes(b"l")
+    st.save(_rec(str(hi), h=2160, audio_cov=0.0), feature_version="fv")   # 4K "muted" (false positive)
+    st.save(_rec(str(lo), h=1080, audio_cov=1.0), feature_version="fv")
+    st.save_match(str(hi), str(lo), "CERTAIN", 0.99, "T1")
+    _rebuild_clusters(st, load_thresholds())            # keep escalates to lo; hi evidence carries ⚠
+    reasons = {r["path"]: r["rank_reason"]
+               for r in st.conn.execute("SELECT path, rank_reason FROM clusters")}
+    assert "NO AUDIO" in reasons[str(hi)]
+    st.close()
+
+    _AudioFixWorker(str(db), "override", [str(hi)]).run()
+
+    s2 = FingerprintStore(db)
+    assert s2.has_quality_override(str(hi))
+    assert s2.audio_warnings() == []                    # hidden from the Quality tab
+    rows = {r["path"]: (r["is_keep"], r["rank_reason"])
+            for r in s2.conn.execute("SELECT path, is_keep, rank_reason FROM clusters")}
+    assert "NO AUDIO" not in rows[str(hi)][1]           # stale ⚠ regenerated away
+    assert rows[str(hi)][0] == 1                        # 4K wins KEEP once its audio is trusted
+    s2.close()

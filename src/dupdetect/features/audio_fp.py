@@ -2,6 +2,7 @@
 Fails on genuinely different audio (different language) and cam rips (room noise)."""
 from __future__ import annotations
 
+import math
 import os
 import re
 import subprocess
@@ -15,7 +16,11 @@ from dupdetect.runtime import resolve_binary
 # rate). feature_version incorporates it -> invalidates old audio_fp cache.
 AUDIO_FP_VERSION = 1
 
-# C4: bump if the cheap coverage scan changes. feature_version incorporates it.
+# C4: incorporated into feature_version. DELIBERATELY NOT bumped for the v2 probe (5s windows,
+# duration-scaled points, all-streams): a bump would invalidate feature_version for EVERY file and
+# force a full re-decode+embed of the library for an audio-only change. The rollout is handled by a
+# targeted store migration instead (store._init_schema, PRAGMA user_version): only rows the v1 probe
+# FLAGGED lose their cache and re-measure lazily with v2.
 COVERAGE_VERSION = 1
 
 # Chromaprint emits ~8.08 items/s (sample 11025 Hz, hop 1365). Used to convert offset to s.
@@ -137,19 +142,50 @@ def _fingerprint_via_ffmpeg(path: str, max_length_s: int, timeout: float | None)
 
 _MEANVOL_RE = re.compile(r"mean_volume:\s*(-?[0-9.]+|-inf) dB")
 
+# v2 probe geometry. WINDOW: 0.5s windows fell inside dialogue pauses / quiet ambient scenes and
+# read as "no audio" (mean < silence_db) — with the 12-point KEEP muted-check, TWO genuinely quiet
+# windows flagged a healthy film. 5s averages across the pause (music/ambience lifts the mean);
+# the probe cost is SEEK-dominated on spinning disks (§1), so decoding 5s instead of 0.5s per
+# probe is nearly free. DENSITY: fixed 40 points over-probes a 22-min episode and under-probes a
+# 3h movie; one probe per ~2 min of runtime (clamped) keeps the granularity uniform per TITLE.
+COVERAGE_WIN_S = 5.0
+COVERAGE_PROBE_EVERY_S = 120.0
+COVERAGE_POINTS_MIN = 8
+COVERAGE_POINTS_MAX = 48
 
-def scan_audio_coverage(path: str, duration_s: float, n_points: int = 40,
-                        win_s: float = 0.5, silence_db: float = -60.0,
+
+def coverage_points(duration_s: float) -> int:
+    """Duration-scaled probe count: one probe per COVERAGE_PROBE_EVERY_S of runtime, clamped to
+    [MIN, MAX]. A pure function of the ffprobe duration -> same input, same probe positions (§0:
+    deterministic, no RNG). 10min->8, 30min->15, 90min->45, >=96min->48."""
+    if duration_s <= 0:
+        return COVERAGE_POINTS_MIN
+    return int(min(COVERAGE_POINTS_MAX,
+                   max(COVERAGE_POINTS_MIN, math.ceil(duration_s / COVERAGE_PROBE_EVERY_S))))
+
+
+def scan_audio_coverage(path: str, duration_s: float, n_points: int | None = None,
+                        win_s: float = COVERAGE_WIN_S, silence_db: float = -60.0,
                         per_probe_timeout_s: float | None = 20.0) -> float:
     """Cheap WHOLE-FILE audio coverage WITHOUT reading the whole file (vs the full
-    fingerprint, ~44x less I/O measured on a 54GB REMUX). Decodes a short `win_s` window at
-    `n_points` timestamps spread across `duration_s` (sparse SEEK), measures mean volume, and
-    returns the fraction of probes with audio above `silence_db`.
+    fingerprint, ~44x less I/O measured on a 54GB REMUX). Decodes a `win_s` window at
+    `n_points` timestamps spread across `duration_s` (sparse SEEK; None -> duration-scaled, see
+    coverage_points), measures mean volume, and returns the fraction of probes with audio above
+    `silence_db`.
+
+    ALL audio streams are probed in ONE pass (`-map 0:a?` — volumedetect instantiates per mapped
+    stream and emits one mean_volume each, verified against the bundled ffmpeg): a probe counts as
+    with-audio if ANY stream is above `silence_db`. The v1 first-stream-only probe (`0:a:0?`)
+    false-flagged files whose track 0 is a commentary / low-level secondary language while the real
+    audio lives on track 1. Same number of seeks — the real cost on a spinning disk (§1).
 
     Detects audio that drops out ANYWHERE (e.g. a copy that goes silent after 15 min, so the
-    user doesn't keep the muted one) at ~duration/n_points granularity. Measures CONTENT, not
-    metadata (§0). Probes that time out / can't be judged are skipped (not counted as silent);
-    returns 1.0 when nothing can be judged -> no false warning."""
+    user doesn't keep the muted one). Measures CONTENT, not metadata (§0). Probes that time out /
+    can't be judged are skipped (not counted as silent); returns 1.0 when nothing can be judged
+    -> no false warning. Thresholds (AUDIO_OK_COVERAGE, silence_db) are unchanged from v1 (§0:
+    never loosened)."""
+    if n_points is None:
+        n_points = coverage_points(duration_s)
     if duration_s <= 0 or n_points <= 0:
         return 1.0
     from dupdetect.util import CREATE_NO_WINDOW
@@ -159,18 +195,18 @@ def scan_audio_coverage(path: str, duration_s: float, n_points: int = 40,
     for i in range(n_points):
         ts = duration_s * (i + 0.5) / n_points         # centered, evenly spread across the file
         cmd = [bin_, "-nostdin", "-ss", f"{ts:.2f}", "-t", f"{win_s}", "-i", path,
-               "-map", "0:a:0?", "-af", "volumedetect", "-f", "null", os.devnull]
+               "-map", "0:a?", "-af", "volumedetect", "-f", "null", os.devnull]
         try:
             proc = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace",
                                   creationflags=CREATE_NO_WINDOW, timeout=per_probe_timeout_s)
         except (subprocess.TimeoutExpired, OSError):
             continue                                    # not judged (broken index / hang)
-        m = _MEANVOL_RE.search(proc.stderr or "")
-        if not m:
+        vols = _MEANVOL_RE.findall(proc.stderr or "")   # one mean_volume PER mapped audio stream
+        if not vols:
             continue                                    # no audio stream at this point / unparseable
         judged += 1
-        if m.group(1) != "-inf" and float(m.group(1)) > silence_db:
-            with_audio += 1
+        if any(v != "-inf" and float(v) > silence_db for v in vols):
+            with_audio += 1                             # ANY stream with audio -> the probe has audio
     return (with_audio / judged) if judged else 1.0
 
 

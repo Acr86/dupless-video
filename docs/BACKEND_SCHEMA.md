@@ -100,7 +100,10 @@ metadata+hash only (`emb_path`, `global_vec`, etc. NULL).
 **Migrations (idempotent, applied at open in `_init_schema`):** `frame_times`, `problems.category`,
 `problems.repair_note`, `audio_coverage`, `color_stats` are `ALTER TABLE … ADD COLUMN` wrapped in
 try/except (so old DBs gain them; `CREATE TABLE IF NOT EXISTS` does not add columns). Stale `problems`
-rows are reclassified from their error message on open (`_reclassify_stale_problems`).
+rows are reclassified from their error message on open (`_reclassify_stale_problems`). One-shot
+data migrations are keyed by **`PRAGMA user_version`** (v1: the coverage-probe v2 rollout NULLs only
+the rows the v1 probe flagged, so they lazily re-measure — a version bump inside `feature_version`
+would have re-decoded the whole library for an audio-only change).
 
 ### 3.2 `matches` — pairwise verdicts (the duplicate graph)
 | Column | Type | Null | Meaning |
@@ -169,6 +172,20 @@ gone **but whose parent dir is reachable** (an unmounted volume is left intact �
 
 Append-only audit for traceability / undo-from-Recycle-Bin.
 
+### 3.7 `quality_overrides` — per-file "Mark audio as OK"
+| Column | Type | Null | Meaning |
+|--------|------|------|---------|
+| `path` | TEXT | no | file the user verified (PK with `kind`) |
+| `kind` | TEXT | no | `'audio'` today; extensible (color, cam, …) |
+| `mtime`, `size` | REAL / INTEGER | no | file identity at override time → the override **auto-expires** when the file changes |
+| `created_at` | REAL | no | |
+
+User correction for a FALSE quality warning (e.g. genuinely quiet content the probe reads as "no
+audio"). Separate table on purpose: a `files` column would be clobbered by `save()`'s upsert on
+re-analysis. Consumed at read time only (`ensure_audio_coverage` → 1.0, `audio_warnings` filter,
+`load_clusters` coalesce) — the MEASURED `files.audio_coverage` is never rewritten, so "restore"
+is just dropping the row. Steers warnings/KEEP only; never a verdict (§0).
+
 ## 4. Cross-table invariants & known coupling
 - **C2 canonicalization:** `matches` and `feedback` both store `a ≤ b` so a pair is one row.
 - **matches ⇄ clusters sync (drift):** byte-identical (T0) clusters historically built without writing
@@ -216,16 +233,17 @@ audio_fp (4·8·sec B ≈ 0.6 MB for a 2h film) + .npy (22 MB)` → the `.npy` d
 | Coarse index build | `all_global_vecs`, `all_window_vecs` (skip NULL vecs) | full scan of `files` |
 | Pass-2 worker load | `SELECT * FROM files WHERE path=?` (read-only handle, `init_schema=False`) | `path` UNIQUE |
 | Cluster rebuild | `all_matches` (full) → union-find; `replace_clusters` (atomic) | full scan of `matches` |
-| KEEP ad detection | `SELECT a_path,b_path,ad_offset_s,video_json FROM matches WHERE a_path=? OR b_path=?` | seq (per member) |
+| KEEP ad detection | `SELECT a_path,b_path,ad_offset_s,video_json FROM matches WHERE a_path=? OR b_path=?` | `UNIQUE(a_path,…)` + `idx_matches_b` |
 | UI list | `clusters` ⋈ `files` (membership + KEEP + metadata) | PK `(cluster_id,path)` |
-| Quality-warnings tab | `audio_warnings` → `WHERE audio_coverage IS NOT NULL AND < threshold` | seq |
+| Quality-warnings tab | `audio_warnings` → `WHERE audio_coverage IS NOT NULL AND < threshold`, minus valid `quality_overrides` | seq |
 
 Hot-path mutations and their side-effects:
 - `save(rec)` — upsert `files`, write `.npy`, `DELETE FROM problems WHERE path=?`,
   **`DELETE FROM matches WHERE a_path=? OR b_path=?`** (re-index invalidates stale pairs).
 - `save_match(...)` — canonicalize `a≤b`, negate `ad_offset_s` if the order flips (**C3** sign
   preservation), upsert on `UNIQUE(a_path,b_path)`.
-- `forget_file(path)` — delete from `files` + `matches` + `clusters`, unlink the `.npy` (no ghosts).
+- `forget_file(path)` — delete from `files` + `matches` + `clusters` + `quality_overrides`, unlink
+  the `.npy` (no ghosts).
 - `replace_clusters(rows)` — single `BEGIN; DELETE FROM clusters; executemany INSERT; COMMIT` (atomic,
   rolls back on error — no interleave with a concurrent rebuild).
 

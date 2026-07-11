@@ -14,6 +14,7 @@ PATH_ROLE = Qt.UserRole + 1
 SIZE_ROLE = Qt.UserRole + 2
 KEEP_ROLE = Qt.UserRole + 3
 KIND_ROLE = Qt.UserRole + 4                         # 'cluster' | 'file' | 'problem' | 'detail'
+AUDIO_BAD_ROLE = Qt.UserRole + 5                    # file carries an audio warning -> context-menu fixes
 
 HEADERS = ["Movie / file", "Resolution", "Size", "Codec", "Language", "Path"]
 PROBLEM_HEADERS = ["File / reason", "Size", "Folder"]
@@ -61,6 +62,7 @@ def _member_row(m: FileRow, cl: ClusterRow, checked: set[str]) -> list[QStandard
     name.setData(m.size, SIZE_ROLE)
     name.setData(m.is_keep, KEEP_ROLE)
     name.setData("file", KIND_ROLE)
+    name.setData(m.audio_bad, AUDIO_BAD_ROLE)           # context menu offers audio fixes, no re-query
     if m.audio_bad:                                     # explain the per-file ⚠ on hover
         name.setToolTip(f"⚠ {m.audio_note} — likely a muted or truncated rip; "
                         "prefer keeping a copy with full audio.")
