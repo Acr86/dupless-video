@@ -428,6 +428,12 @@ def test_split_selected_keeps_them_grouped_together(tmp_path, monkeypatch):
     assert len({r[0] for r in st.conn.execute("SELECT cluster_id FROM clusters")}) == 1  # all fused
     st.close()
 
+    # The fixture paths are DB-only (no files on disk). MainWindow prunes missing files on open, which
+    # on POSIX would forget all four and empty the clusters before the split runs (a real absolute path
+    # that doesn't exist -> pruned; on Windows the volume-root guard spares them). This test is about the
+    # split logic, not disk reconciliation, so neutralize the open-time prune.
+    monkeypatch.setattr(FingerprintStore, "prune_missing_files", lambda self: 0)
+
     QApplication.instance() or QApplication([])
     w = MainWindow(str(db))
     w._split_from_group(["/s1.mkv", "/s2.mkv"])                    # both don't belong -> split TOGETHER
