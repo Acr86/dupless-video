@@ -565,6 +565,40 @@ class FingerprintStore:
         """All indexed paths (full or lite). For name-based grouping."""
         return [r["path"] for r in self.conn.execute("SELECT path FROM files")]
 
+    def delete_match(self, a: str, b: str, commit: bool = True) -> None:
+        """Remove ONE pair's row (canonicalized). Used when a pair RE-DECIDES to DIFFERENT: DIFFERENT is
+        never kept in `matches` (schema), so a prior duplicate/review row must be dropped, not left to
+        keep fusing a cluster. Idempotent (deleting an absent pair is a no-op)."""
+        ca, cb = canonical_pair(a, b)
+        self.conn.execute("DELETE FROM matches WHERE a_path=? AND b_path=?", (ca, cb))
+        if commit:
+            self.conn.commit()
+
+    def delete_matches(self, pairs) -> int:
+        """Batch-delete pairs (each canonicalized) in ONE transaction. Returns how many rows were
+        removed. For the scan's delete-on-DIFFERENT sweep, where per-pair commits would be far too many."""
+        n = 0
+        for a, b in pairs:
+            ca, cb = canonical_pair(a, b)
+            n += self.conn.execute("DELETE FROM matches WHERE a_path=? AND b_path=?", (ca, cb)).rowcount
+        self.conn.commit()
+        return n
+
+    def matched_pairs(self) -> set[tuple[str, str]]:
+        """Set of canonical (a_path, b_path) that currently HAVE a row. Small (DIFFERENT is not kept),
+        so Pass-2 can preload it and delete-on-DIFFERENT only the few pairs that actually flipped —
+        never touching the millions of never-matched candidate pairs."""
+        return {(r["a_path"], r["b_path"])
+                for r in self.conn.execute("SELECT a_path, b_path FROM matches")}
+
+    def prune_matches_by_verdict(self, verdict: str) -> int:
+        """Delete every row with this verdict (one transaction). Maintenance for DIFFERENT rows that an
+        older re-decide upserted in place instead of dropping — they bloat every clusters/verdict read
+        without ever being used (DIFFERENT never clusters). Returns rows removed."""
+        cur = self.conn.execute("DELETE FROM matches WHERE verdict=?", (verdict,))
+        self.conn.commit()
+        return cur.rowcount
+
     def all_matches(self) -> list[tuple[str, str, str]]:
         """(a_path, b_path, verdict) for ALL persisted pairs. Clusters are
         derived from here (global graph), not from a single run's yields -> so a

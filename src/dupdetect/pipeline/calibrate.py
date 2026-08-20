@@ -163,6 +163,18 @@ def verdict_of(sig: LabeledSignal, th: Thresholds) -> Verdict:
     return decide_tree(_mk("a", "ha"), _mk("b", "hb"), sig.audio, sig.video, sig.scenes, th).verdict
 
 
+def _rewrite_redecision(store, r, res) -> None:
+    """Persist a re-decided row: a DIFFERENT verdict DROPS the row (schema: DIFFERENT is not kept, so
+    upserting it in place only bloats the table); any other verdict upserts the new tier in place,
+    reusing the stored raw signals."""
+    if res.verdict == Verdict.DIFFERENT:
+        store.delete_match(r["a_path"], r["b_path"])
+    else:
+        store.save_match(r["a_path"], r["b_path"], res.verdict.value, res.confidence, res.reason,
+                         ad_offset_s=r["ad_offset_s"], audio_json=r["audio_json"],
+                         video_json=r["video_json"], scenes_json=r["scenes_json"])
+
+
 def apply_thresholds_to_store(store, th: Thresholds, rebuild: bool = True) -> dict:
     """Re-apply thresholds `th` to the EXISTING matches WITHOUT re-decoding or re-aligning.
 
@@ -200,10 +212,7 @@ def apply_thresholds_to_store(store, th: Thresholds, rebuild: bool = True) -> di
             changed += 1
             key = f"{r['verdict']}->{res.verdict.value}"
             transitions[key] = transitions.get(key, 0) + 1
-            store.save_match(r["a_path"], r["b_path"], res.verdict.value, res.confidence,
-                             res.reason, ad_offset_s=r["ad_offset_s"],
-                             audio_json=r["audio_json"], video_json=r["video_json"],
-                             scenes_json=r["scenes_json"])
+            _rewrite_redecision(store, r, res)
     clusters = 0
     if rebuild:
         from dupdetect.pipeline.fullscan import _rebuild_clusters  # deferred: avoids import cycle

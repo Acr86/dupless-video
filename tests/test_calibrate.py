@@ -216,6 +216,22 @@ def test_labeled_from_feedback_skips_lite_without_embeddings(store, th, monkeypa
 
 # ------------------------------------------------- apply_thresholds (frozen-app write target)
 
+def test_apply_thresholds_to_store_drops_rows_that_redecide_to_different(th, store):
+    """Re-deciding a stored row to DIFFERENT must DELETE it (schema: DIFFERENT is not kept), not upsert
+    a DIFFERENT row in place. This is the fix for the 314k dead-weight rows an in-place re-decide left,
+    and it keeps a re-decide self-cleaning instead of accumulating."""
+    from dupdetect.pipeline.calibrate import apply_thresholds_to_store
+    store.save(_rec("/a"), feature_version="fv")
+    store.save(_rec("/b"), feature_version="fv")
+    weak = json.dumps({"score": 0.1, "coverage": 0.1})    # all signals weak -> decide_tree -> DIFFERENT
+    store.save_match("/a", "/b", "HIGH", 0.88, "stale T3",
+                     audio_json=weak, video_json=weak, scenes_json=weak)
+    assert store.has_match("/a", "/b") is True
+    out = apply_thresholds_to_store(store, th, rebuild=False)
+    assert store.has_match("/a", "/b") is False           # dropped, not rewritten as a DIFFERENT row
+    assert out["transitions"].get("HIGH->DIFFERENT") == 1
+
+
 def test_apply_thresholds_frozen_writes_user_override(tmp_path, monkeypatch):
     """Frozen app: the bundled thresholds.yaml is READ-ONLY, so recalibrate must write a per-user
     OVERRIDE in the data dir (not crash with WinError 5), and load_thresholds then prefers it."""

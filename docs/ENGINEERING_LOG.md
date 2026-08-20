@@ -11,6 +11,33 @@ Newest on top. Append-only in spirit. Deep rationale for the design invariants l
 
 ## Entries
 
+### UI freezes ~30s on "Clean missing" during a scan — refresh scans the whole `matches` table (×2)
+- **Symptom:** clicking "Clean missing" (or ↻) while a scan is matching froze the window for ~30s.
+- **Root cause (two compounding):**
+  1. `_refresh_with_prune` skips the *background* prune worker during a scan, but the SYNCHRONOUS
+     `refresh()` it calls first is NOT skipped — and `refresh()` does TWO full-table scans of `matches`
+     on the GUI thread: `data._annotate_verdicts` (`SELECT … FROM matches`) and `data.drift_report`
+     (`store.all_matches()`). Measured ~5.3s EACH even warm; during a scan the writer's WAL growth +
+     cache churn balloon them to ~30s. GUI thread blocked = frozen window.
+  2. The table was bloated to 338k rows, **92% DIFFERENT** — dead weight (clustering never reads
+     DIFFERENT). The bloat came from a prior `apply_thresholds_to_store` that upserted DIFFERENT rows
+     in place instead of dropping them (schema line ~67: "DIFFERENT verdicts aren't kept").
+- **Fix (0.1.4 — perf/§1, verdict-invariant):**
+  - **A — delete-on-DIFFERENT (self-cleaning):** `apply_thresholds_to_store` and the parallel Pass-2
+    (`match_pairs_parallel`) now DROP a pair's row when it re-decides to DIFFERENT instead of writing
+    it. Scan-side is scale-safe: preload `store.matched_pairs()` (small) and delete only pairs that
+    actually had a row — the millions of never-matched candidate pairs are never touched. New store
+    methods: `delete_match`, `delete_matches`, `matched_pairs`, `prune_matches_by_verdict`.
+  - **B — `drift_report` in SQL:** replaced the O(all-matches) Python-set build with index-friendly
+    `IN (SELECT a_path…)/(b_path…)` (matches PK + idx_matches_b). Measured ~0.004s vs ~5.2s.
+  - **C — `_annotate_verdicts` scoped:** `WHERE a_path IN (SELECT path FROM clusters)` (canonical a<=b
+    means an intra-cluster pair always has its a_path clustered) — refresh scans the FEW clustered rows,
+    not the whole table, so it's O(clusters) regardless of DIFFERENT bloat.
+- **Note:** the live DB had already reset when the library moved to the NAS (paths `L:\`→`M:\` →
+  prune forgot everything → files 329, matches/clusters 0), so no one-time purge was needed; the fixes
+  keep the bloat from recurring. Tests: `test_store` (the 4 new methods), `test_calibrate` /
+  `test_fullscan` (re-decide to DIFFERENT drops the row), `test_ui` (drift keys preserved).
+
 ### Mega-cluster persisted after the CONTAINS fix — a POISONED per-user thresholds override (θv 0.5)
 - **Symptom:** after shipping the CONTAINS guard (entry below) a fresh Standard scan STILL produced a
   1338-member cluster (down from 1621, so CONTAINS worked — 31k CONTAINS rows emitted — but something

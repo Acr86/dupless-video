@@ -360,6 +360,12 @@ def match_pairs_parallel(paths, store: FingerprintStore, index: CoarseIndex,
     if not pair_list:
         return
     aligned: list[str] = []
+    # DELETE-ON-DIFFERENT (self-cleaning re-scan): a pair that RE-DECIDES to DIFFERENT must drop any
+    # stale row it had (else an old duplicate/review verdict keeps fusing a cluster forever). Guarded by
+    # the preloaded set of pairs that actually HAVE a row (small — DIFFERENT is never kept), so the
+    # millions of never-matched candidate pairs are ignored, not deleted one by one.
+    existing = store.matched_pairs()
+    stale: list[tuple[str, str]] = []
     # single_threaded_blas: pin each worker's BLAS to 1 thread BEFORE the pool spawns, so W processes
     # don't oversubscribe the cores with W*cores matmul threads (perf, §1; verdict unchanged, §0).
     with single_threaded_blas(), ProcessPoolExecutor(
@@ -369,6 +375,10 @@ def match_pairs_parallel(paths, store: FingerprintStore, index: CoarseIndex,
             aligned.append(_pair_hash(pr))             # record EVERY aligned pair (match OR different)
             if row is not None:
                 yield row
+            elif canonical_pair(pr[0], pr[1]) in existing:   # DIFFERENT now, but had a row -> drop it
+                stale.append(pr)
+    if stale:
+        store.delete_matches(stale)
     if fingerprint is not None:
         store.evaluated_pairs_add(aligned, fingerprint)
 

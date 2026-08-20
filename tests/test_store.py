@@ -136,6 +136,29 @@ def test_problems_persistence_and_auto_cleanup(store):
     assert store.problems() == []
 
 
+def test_delete_match_and_matched_pairs(store):
+    """delete_match drops ONE pair (canonicalized, order-independent); matched_pairs is the small set of
+    pairs that currently have a row (preloaded by the scan's delete-on-DIFFERENT guard)."""
+    store.save_match("/a", "/b", "CERTAIN", 0.99, "T1")
+    store.save_match("/c", "/d", "HIGH", 0.88, "T3")
+    assert store.matched_pairs() == {("/a", "/b"), ("/c", "/d")}
+    store.delete_match("/b", "/a")                         # reversed order -> still canonical (/a,/b)
+    assert store.has_match("/a", "/b") is False
+    assert store.matched_pairs() == {("/c", "/d")}
+
+
+def test_delete_matches_batch_and_prune_by_verdict(store):
+    """delete_matches removes many pairs in one transaction; prune_matches_by_verdict drops every row of
+    a verdict (the maintenance sweep for DIFFERENT rows an old re-decide upserted in place)."""
+    store.save_match("/a", "/b", "DIFFERENT", 0.0, "T5")
+    store.save_match("/a", "/c", "DIFFERENT", 0.0, "T5")
+    store.save_match("/a", "/d", "CERTAIN", 0.99, "T1")
+    assert store.prune_matches_by_verdict("DIFFERENT") == 2
+    assert store.matched_pairs() == {("/a", "/d")}
+    assert store.delete_matches([("/d", "/a")]) == 1       # reversed -> canonical (/a,/d)
+    assert store.matched_pairs() == set()
+
+
 def test_has_unchanged_problem_guards_known_corrupt(tmp_path):
     """save_problem stamps mtime+size; has_unchanged_problem is True only while the file is unchanged
     -> the scan/watcher skips a known-corrupt file instead of re-decoding it every cycle."""

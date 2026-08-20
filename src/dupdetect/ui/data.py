@@ -157,8 +157,12 @@ def load_clusters(store: FingerprintStore) -> list[ClusterRow]:
 def _annotate_verdicts(store: FingerprintStore, grouped: dict[int, ClusterRow]) -> None:
     """Assigns each cluster the strongest verdict/confidence from matches between its members."""
     member_to_cid = {m.path: cid for cid, cl in grouped.items() for m in cl.members}
+    # Only matches whose a_path is a cluster member (a<=b canonical, so an intra-cluster pair always has
+    # its a_path clustered): the IN hits the matches PK on a_path, so refresh scans the FEW clustered
+    # rows, not the whole table (DIFFERENT/unclustered rows never touched -> no GUI freeze at scale).
     for a, b, verdict, conf in store.conn.execute(
-            "SELECT a_path, b_path, verdict, confidence FROM matches"):
+            "SELECT a_path, b_path, verdict, confidence FROM matches "
+            "WHERE a_path IN (SELECT path FROM clusters)"):
         cid = member_to_cid.get(a)
         if cid is None or member_to_cid.get(b) != cid:
             continue
@@ -215,14 +219,24 @@ def drift_report(store: FingerprintStore) -> dict:
     """Detects DESYNC between `clusters` and `matches`. Clusters are a derived view
     of `matches`; if they come from different scans (e.g. an `exact_scan` rebuilds clusters by hash
     without touching matches), their paths do not appear in matches -> the verdict is empty (all fall to
-    'Review only') and feedback does not carry over on recalibration. `drifted` = no shared path at all."""
-    match_paths: set[str] = set()
-    for a, b, _ in store.all_matches():
-        match_paths.add(a); match_paths.add(b)
-    cluster_paths = {r["path"] for r in store.conn.execute("SELECT path FROM clusters")}
-    orphan = cluster_paths - match_paths
+    'Review only') and feedback does not carry over on recalibration. `drifted` = no shared path at all.
+
+    Computed in SQL against the indexes (matches PK a_path + idx_matches_b), NOT by loading the whole
+    `matches` table into a Python set: on a large library that full scan ran on the GUI thread every
+    refresh (twice, with _annotate_verdicts) and, contended by a running scan's writes, froze the
+    window for tens of seconds. Here only the small `clusters` set is materialized."""
+    n_clusters = store.conn.execute("SELECT COUNT(DISTINCT path) FROM clusters").fetchone()[0]
+    if not n_clusters:
+        return {"orphan_paths": 0, "cluster_paths": 0, "drifted": False}
+    # Cluster paths that appear in matches (as a_path or b_path) — each IN hits an index; UNION dedups.
+    matched = store.conn.execute(
+        "SELECT COUNT(*) FROM ("
+        "  SELECT path FROM clusters WHERE path IN (SELECT a_path FROM matches) "
+        "  UNION "
+        "  SELECT path FROM clusters WHERE path IN (SELECT b_path FROM matches))"
+    ).fetchone()[0]
     return {
-        "orphan_paths": len(orphan),
-        "cluster_paths": len(cluster_paths),
-        "drifted": bool(cluster_paths) and not (cluster_paths & match_paths),
+        "orphan_paths": n_clusters - matched,
+        "cluster_paths": n_clusters,
+        "drifted": matched == 0,
     }

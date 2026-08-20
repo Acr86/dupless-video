@@ -435,7 +435,8 @@ def test_apply_thresholds_to_store_redecides_from_stored_signals(th, store):
     assert _verdict("/n1.mkv") == "NAME_COPY"                       # signal-less row untouched
 
     # counter-check (new semantics): tightening VIDEO below the stored score now drops a pair with
-    # no scene corroboration straight to DIFFERENT — the audio-only T4b review path was removed.
+    # no scene corroboration to DIFFERENT — and DIFFERENT is NOT kept in `matches` (schema), so the
+    # re-decide DELETES the row (self-cleaning) instead of leaving a dead-weight DIFFERENT row.
     store.save_match(
         "/a.mkv", "/b.mkv", "CERTAIN", 0.99, "T1 placeholder",      # reset the row to CERTAIN
         audio_json=_json.dumps({"score": 0.85}),
@@ -443,8 +444,9 @@ def test_apply_thresholds_to_store_redecides_from_stored_signals(th, store):
         scenes_json=_json.dumps({"score": 0.0}))
     tv_raw = copy.deepcopy(th.raw)
     tv_raw["video"]["theta_v"] = 0.95
-    apply_thresholds_to_store(store, Thresholds(raw=tv_raw))
-    assert _verdict("/a.mkv") == "DIFFERENT"
+    rep_diff = apply_thresholds_to_store(store, Thresholds(raw=tv_raw))
+    assert store.has_match("/a.mkv", "/b.mkv") is False             # re-decided DIFFERENT -> row dropped
+    assert rep_diff["transitions"].get("CERTAIN->DIFFERENT") == 1
 
 
 def test_apply_thresholds_action_reapplies_to_store(store, tmp_path):

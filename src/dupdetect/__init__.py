@@ -1,2 +1,2 @@
 """dup-detector: identity (tiered decision tree) + quality, separated."""
-__version__ = "0.1.3"
+__version__ = "0.1.4"
