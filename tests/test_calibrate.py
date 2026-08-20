@@ -15,8 +15,13 @@ import pytest
 from dupdetect.config import load_thresholds
 from dupdetect.models import AlignResult, Probe, Quality, Record, Verdict
 from dupdetect.pipeline.calibrate import (
-    LabeledSignal, confusion_by_genre, confusion_by_tier, labeled_signals_from_feedback,
-    load_pairs, suggest_thresholds, verdict_of,
+    LabeledSignal,
+    confusion_by_genre,
+    confusion_by_tier,
+    labeled_signals_from_feedback,
+    load_pairs,
+    suggest_thresholds,
+    verdict_of,
 )
 from dupdetect.store import FingerprintStore
 

@@ -44,7 +44,7 @@ def _age(p, secs: float = 100.0) -> None:
     os.utime(p, (t, t))                              # make mtime old -> 'stable'
 
 
-def _ctx(targets, store, th, embedder=None) -> "watch.WatchContext":
+def _ctx(targets, store, th, embedder=None) -> watch.WatchContext:
     """Bundle the watcher deps the way callers do now (targets/store/embedder/th)."""
     return watch.WatchContext(str(targets), store, embedder or _DummyEmbedder(), th)
 

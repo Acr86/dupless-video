@@ -8,8 +8,8 @@ import json
 import os
 import sqlite3
 import time
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator, Optional
 
 import numpy as np
 
@@ -50,7 +50,7 @@ class FingerprintStore:
             self._init_schema()
 
     def _init_schema(self) -> None:
-        with open(SCHEMA, "r", encoding="utf-8") as f:
+        with open(SCHEMA, encoding="utf-8") as f:
             self.conn.executescript(f.read())
         # Idempotent migration: DBs created before `frame_times` gain the column
         # (CREATE TABLE IF NOT EXISTS does not add columns to existing tables).
@@ -144,7 +144,7 @@ class FingerprintStore:
             return False
         return self._emb_file(ep).exists()
 
-    def content_hash_if_unchanged(self, path: str, st: os.stat_result) -> Optional[str]:
+    def content_hash_if_unchanged(self, path: str, st: os.stat_result) -> str | None:
         """Stored content_hash if the file has NOT changed (same mtime+size), regardless of
         feature_version. 'Exact-only' mode: reuses the hash from already-indexed records (does not
         re-hash or clobber FULL records), and is incremental across runs."""
@@ -404,7 +404,7 @@ class FingerprintStore:
         self.conn.commit()
 
     # ---- lectura ---------------------------------------------------------
-    def load(self, path: str, with_embeddings: bool = True) -> Optional[Record]:
+    def load(self, path: str, with_embeddings: bool = True) -> Record | None:
         row = self.conn.execute(
             "SELECT * FROM files WHERE path = ?", (str(path),)
         ).fetchone()

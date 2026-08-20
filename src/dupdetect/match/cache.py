@@ -22,7 +22,7 @@ class EmbeddingCache:
                  device: str | None = None):
         self.store = store
         self.max_items = max_items          # None => no limit (all fit)
-        self._cache: "OrderedDict[str, Any]" = OrderedDict()
+        self._cache: OrderedDict[str, Any] = OrderedDict()
         self._device = device               # None => auto (cuda if available, else cpu)
 
     def _resolve_device(self):

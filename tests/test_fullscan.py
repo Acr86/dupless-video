@@ -10,7 +10,12 @@ import pytest
 from dupdetect.config import load_thresholds
 from dupdetect.models import Probe, Quality, Record
 from dupdetect.pipeline.fullscan import (
-    UnionFind, _cluster_has_ads, _rebuild_clusters, exact_scan, full_scan, rank_cluster,
+    UnionFind,
+    _cluster_has_ads,
+    _rebuild_clusters,
+    exact_scan,
+    full_scan,
+    rank_cluster,
 )
 from dupdetect.store import FingerprintStore, canonical_pair
 
@@ -137,7 +142,6 @@ def test_cluster_has_midroll_ads_via_interleaved_ratio(th, store):
 def test_needs_analysis_skips_unchanged_corrupt(tmp_path):
     """Pass-1 must not re-decode a known-corrupt file that didn't change (it would fail again and sit
     'unprocessed' forever). Skipped while unchanged; retried after force or a content change."""
-    import os
 
     from dupdetect.pipeline.fullscan import _needs_analysis
     from dupdetect.store import FingerprintStore
@@ -308,6 +312,7 @@ def test_drain_pipelined_processes_all_and_is_resilient(monkeypatch, store):
     and routes corrupt ones to `skipped`/problems without crashing the rest. No GPU:
     decode_frames and _gpu_finish are mocked."""
     from concurrent.futures import Future
+
     from dupdetect.pipeline import fullscan as fs
 
     class _Cpu:
@@ -498,6 +503,7 @@ def test_full_scan_skips_corrupt_file(th, store, tmp_path):
 def test_filter_by_height(tmp_path):
     """filter_by_height splits by height; unmeasurable (corrupt) files are KEPT."""
     import av
+
     from dupdetect.pipeline.fullscan import filter_by_height
 
     def _mk(name, h):

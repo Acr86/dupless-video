@@ -10,8 +10,8 @@ import os
 import subprocess
 import tempfile
 import threading
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 from dupdetect.features.probe import ffprobe
 from dupdetect.util import CREATE_NO_WINDOW

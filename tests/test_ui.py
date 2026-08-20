@@ -12,7 +12,14 @@ import pytest
 
 from dupdetect.models import AlignResult, Probe, Quality, Record
 from dupdetect.store import FingerprintStore
-from dupdetect.ui.data import ClusterRow, FileRow, clean_title, is_actionable, load_clusters, sort_clusters
+from dupdetect.ui.data import (
+    ClusterRow,
+    FileRow,
+    clean_title,
+    is_actionable,
+    load_clusters,
+    sort_clusters,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -25,8 +32,9 @@ def _isolate_qsettings(tmp_path_factory, monkeypatch):
     through to return a throwaway INI-backed QSettings under tmp -> fully isolated, and an empty
     `watch_folder` means no autostart. No-op without Qt."""
     try:
-        import dupdetect.ui.main as _m
         from PySide6.QtCore import QSettings
+
+        import dupdetect.ui.main as _m
     except ImportError:
         return
     QSettings.setPath(QSettings.IniFormat, QSettings.UserScope, str(tmp_path_factory.mktemp("qset")))
@@ -617,6 +625,7 @@ def test_set_as_master_keeps_cluster_visible(tmp_path, monkeypatch):
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     pytest.importorskip("PySide6")
     from PySide6.QtWidgets import QApplication
+
     from dupdetect.store import FingerprintStore
     from dupdetect.ui.model import PATH_ROLE
 
@@ -667,6 +676,7 @@ def test_watch_panel_parses_dup_and_cycle_lines(monkeypatch):
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     pytest.importorskip("PySide6")
     from PySide6.QtWidgets import QApplication
+
     from dupdetect.ui.watch_panel import WatchPanel
     QApplication.instance() or QApplication([])
     wp = WatchPanel("/db.sqlite")

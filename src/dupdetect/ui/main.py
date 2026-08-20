@@ -10,20 +10,43 @@ from pathlib import Path
 from PySide6.QtCore import QProcess, QProcessEnvironment, QSettings, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QComboBox, QDialog, QDialogButtonBox,
-    QFileDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow, QMenu,
-    QMessageBox, QProgressBar, QPushButton, QSystemTrayIcon, QTabWidget,
-    QTreeView, QVBoxLayout, QWidget,
+    QAbstractItemView,
+    QApplication,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QSystemTrayIcon,
+    QTabWidget,
+    QTreeView,
+    QVBoxLayout,
+    QWidget,
 )
 
-from dupdetect import runtime
+from dupdetect import __version__, runtime
 from dupdetect.store import FingerprintStore
-from dupdetect import __version__
 from dupdetect.ui import actions, startup
 from dupdetect.ui.data import clean_title, drift_report, is_actionable, load_clusters, sort_clusters
 from dupdetect.ui.model import (
-    AUDIO_BAD_ROLE, KIND_ROLE, PATH_ROLE, build_audio_warning_model, build_model,
-    build_problem_model, checked_files, checked_problems, problem_paths, remove_paths,
+    AUDIO_BAD_ROLE,
+    KIND_ROLE,
+    PATH_ROLE,
+    build_audio_warning_model,
+    build_model,
+    build_problem_model,
+    checked_files,
+    checked_problems,
+    problem_paths,
+    remove_paths,
 )
 from dupdetect.ui.scan_panel import ScanPanel
 from dupdetect.ui.watch_panel import WatchPanel
@@ -139,7 +162,6 @@ class MainWindow(QMainWindow):
         self._persisted: set = set()                    # trees restored from a previous session
         self._prune_worker: _PruneWorker | None = None  # background disk reconcile (one at a time)
         self._audio_worker: _AudioFixWorker | None = None   # background audio re-check/override
-        from dupdetect import __version__
         self.setWindowTitle(f"Dupless Video {__version__}")   # no DB path in the title (privacy + noise)
         _icon = Path(__file__).with_name("icon.ico")
         if _icon.exists():
@@ -1109,7 +1131,7 @@ _SINGLETON = "dupdetect-ui-singleton"
 
 def run(db_path: str, start_hidden: bool = False) -> int:
     try:                                                # own identity in the taskbar
-        import ctypes                                   # AUMID in Company.Product.Version format
+        import ctypes  # AUMID in Company.Product.Version format
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("DupDetector.VideoDedup.1")
     except Exception:                                   # non-Windows / no shell32
         pass

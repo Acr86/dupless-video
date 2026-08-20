@@ -186,5 +186,5 @@ class Thresholds:
 
 def load_thresholds(path: Path | str | None = None) -> Thresholds:
     p = Path(path) if path else effective_config_path()
-    with open(p, "r", encoding="utf-8") as f:
+    with open(p, encoding="utf-8") as f:
         return Thresholds(raw=yaml.safe_load(f))

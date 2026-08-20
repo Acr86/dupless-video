@@ -14,7 +14,6 @@ import numpy as np
 import pytest
 
 from dupdetect.align.video import _detect_superset, align_video, banded_align, resample_to_grid
-from dupdetect.models import AlignResult
 
 torch = pytest.importorskip("torch")
 

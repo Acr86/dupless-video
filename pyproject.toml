@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "ruff>=0.4", "mypy>=1.10", "Cython>=3.0"]
+dev = ["pytest>=8.0", "pytest-cov>=5.0", "ruff>=0.4", "mypy>=1.10", "pre-commit>=3.7", "Cython>=3.0"]
 ui = ["PySide6>=6.7", "send2trash>=1.8", "opencv-python-headless>=4.8"]   # `dupdetect ui`: Qt app + live-view JPEG encode (cv2.imencode)
 # OPTIONAL: native filesystem events for the watcher (ReadDirectoryChangesW / inotify / FSEvents).
 # Without it the watcher still works via backoff polling; with it: instant reaction + minimal churn.
@@ -44,7 +44,28 @@ where = ["src"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# Helper entry scripts and build outputs are not part of the shipped package — keep them out of the gate.
+extend-exclude = ["scripts", "build", "dist", "bundle"]
+
+[tool.ruff.lint]
+# Explicit `select` so the gate is deterministic across ruff versions: pycodestyle errors (E),
+# pyflakes (F: unused/undefined names), import sorting (I), and safe pyupgrade modernizations (UP).
+select = ["E", "F", "I", "UP"]
+# E501 (line length): the house style is densely commented; length is not gated (formatter's job).
+# E402 (import not at top): several modules import after a __future__/sys guard on purpose.
+# E70x (compound statements / semicolons): the house style uses compact `a; b` one-liners on purpose.
+# UP031 (printf -> f-string): a few %-joins carry bytes with surrogatepass — f-strings would change semantics.
+# UP042 (StrEnum): Verdict subclasses str+Enum deliberately (stable .value serialization to the DB).
+ignore = ["E501", "E402", "E701", "E702", "E703", "UP031", "UP042"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["F811"]   # pytest fixtures legitimately shadow imported names (redefinition is intended)
+# cli.py imports are split by an early stdout UTF-8 reconfigure (must run before the heavy imports);
+# each block is sorted, but isort sees the split as one unsorted block -> ignore just this rule here.
+"src/dupdetect/cli.py" = ["I001"]
 
 [tool.mypy]
 python_version = "3.11"
 ignore_missing_imports = true
+# Types are added incrementally; mypy runs in CI as ADVISORY (non-blocking) until the package is
+# fully annotated. Kept here so `mypy src/dupdetect` is reproducible locally and in CI.

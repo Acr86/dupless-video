@@ -16,33 +16,43 @@ import hashlib
 import json
 import os
 import subprocess
+from collections.abc import Iterable
 from concurrent.futures import (
-    FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait,
+    FIRST_COMPLETED,
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    as_completed,
+    wait,
 )
 from dataclasses import asdict
 from pathlib import Path
-from typing import Iterable, Optional
+
+from tqdm import tqdm
 
 from dupdetect.config import Thresholds
 from dupdetect.features.audio_fp import AUDIO_COV_TOL, AUDIO_OK_COVERAGE
 from dupdetect.features.embeddings import Embedder
-from dupdetect.match.cache import EmbeddingCache
-from dupdetect.match.matcher import match, match_pairs_parallel, name_pair_content_differs
-from dupdetect.match.retrieval import CoarseIndex
-from dupdetect.match.tree import DUPLICATE_VERDICTS, REVIEW_VERDICTS
-from dupdetect.models import Verdict
-from tqdm import tqdm
-
 from dupdetect.features.frames import decode_frames
 from dupdetect.features.hashing import content_hash
 from dupdetect.features.probe import ffprobe
-from dupdetect.match.tree import DECISION_VERSION, T0_REASON
+from dupdetect.match.cache import EmbeddingCache
+from dupdetect.match.matcher import match, match_pairs_parallel, name_pair_content_differs
+from dupdetect.match.retrieval import CoarseIndex
+from dupdetect.match.tree import DECISION_VERSION, DUPLICATE_VERDICTS, REVIEW_VERDICTS, T0_REASON
+from dupdetect.models import Verdict
+from dupdetect.pipeline.analyze import (
+    analysis_state,
+    analyze_file,
+    build_record,
+    ensure_audio_coverage,
+    extract_cpu_features,
+    extract_gpu_features,
+    feature_version,
+    maybe_emit_viz,
+    record_from_donor,
+)
 from dupdetect.quality.color import CLIP_DOWNGRADE_MARGIN, GRADE_DIVERGENCE
 from dupdetect.quality.language import detect_language
-from dupdetect.pipeline.analyze import (
-    analysis_state, analyze_file, build_record, ensure_audio_coverage, extract_cpu_features,
-    extract_gpu_features, feature_version, maybe_emit_viz, record_from_donor,
-)
 from dupdetect.store import FingerprintStore
 from dupdetect.store.store import canonical_pair
 
@@ -508,7 +518,7 @@ def _stable_cluster_id(members: list[str]) -> int:
     return int.from_bytes(hashlib.blake2b(key, digest_size=7).digest(), "big")
 
 
-def _rebuild_clusters(store: FingerprintStore, th: Thresholds, reuse: Optional[dict] = None,
+def _rebuild_clusters(store: FingerprintStore, th: Thresholds, reuse: dict | None = None,
                       progress: bool = False) -> list[dict]:
     """A5: clusters = derived view of the GLOBAL `matches` graph (not the yields of this run).
     Rebuilds the full table ATOMICALLY (one transaction via store.replace_clusters) with STABLE,

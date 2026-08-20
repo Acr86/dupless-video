@@ -10,8 +10,6 @@ import pytest
 
 from dupdetect.features.frames import (
     DEFAULT_SIZE,
-    DINOV2_MEAN,
-    DINOV2_STD,
     decode_frames,
     sample_timestamps,
 )

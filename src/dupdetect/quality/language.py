@@ -20,7 +20,6 @@ M3: runs on CPU (int8) in the extract_cpu_features workers (does not cross CUDA 
 from __future__ import annotations
 
 import subprocess
-from typing import Optional
 
 import numpy as np
 
@@ -142,7 +141,7 @@ def _region_starts(dur: float, fracs: tuple[float, ...]) -> list[float]:
 
 
 def detect_language(path: str, model: str = "base", device: str = "cpu",
-                    n_extra: int = 2, min_confidence: float = 0.6) -> Optional[str]:
+                    n_extra: int = 2, min_confidence: float = 0.6) -> str | None:
     """Real audio language (ISO 639-2/B: 'spa','eng','rus',...) or None if no audio.
 
     VAD by regions + multi-window vote (see module). Robust to dialogue-free intros,

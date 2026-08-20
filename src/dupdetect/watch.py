@@ -19,8 +19,8 @@ from __future__ import annotations
 
 import os
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable, Optional
 
 from dupdetect.config import Thresholds
 from dupdetect.features.embeddings import Embedder
@@ -130,7 +130,7 @@ class CycleResult:
     dup_clusters: list = field(default_factory=list)   # dup clusters that include a new file
     errors: list = field(default_factory=list)         # (path, error) for skipped/corrupt files
 
-    def merge(self, other: "CycleResult") -> "CycleResult":
+    def merge(self, other: CycleResult) -> CycleResult:
         """Fold the heavy ingest half into this (the removals half) and return self. `removed` is
         OWNED by reconcile_removals and never set by ingest_new, so it is intentionally not merged."""
         self.indexed += other.indexed
@@ -304,9 +304,9 @@ class _IngestScheduler:
         return out
 
 
-def ingest_new(ctx: WatchContext, tuning: WatchTuning, *, scheduler: "_IngestScheduler",
-               on_duplicate: Optional[Callable[[list], None]] = None,
-               on_detect: Optional[Callable[[int], None]] = None,
+def ingest_new(ctx: WatchContext, tuning: WatchTuning, *, scheduler: _IngestScheduler,
+               on_duplicate: Callable[[list], None] | None = None,
+               on_detect: Callable[[int], None] | None = None,
                now: float | None = None) -> CycleResult:
     """HEAVY half of a cycle: index up to `tuning.ingest_chunk` NEW/CHANGED stable files this cycle
     (FAST lane first, then OLDEST backlog — see _IngestScheduler), match them incrementally against the
@@ -351,9 +351,9 @@ def ingest_new(ctx: WatchContext, tuning: WatchTuning, *, scheduler: "_IngestSch
     return res
 
 
-def watch_once(ctx: WatchContext, tuning: Optional[WatchTuning] = None, *,
-               on_duplicate: Optional[Callable[[list], None]] = None,
-               on_detect: Optional[Callable[[int], None]] = None) -> CycleResult:
+def watch_once(ctx: WatchContext, tuning: WatchTuning | None = None, *,
+               on_duplicate: Callable[[list], None] | None = None,
+               on_detect: Callable[[int], None] | None = None) -> CycleResult:
     """One FULL reconcile cycle = removals (cheap) + new-file ingest (heavy), combined. Retained for
     `watch --once` and tests; the watch LOOP runs the two halves at DIFFERENT priorities (removals
     always, even during a scan; ingest only when no scan holds the lock)."""
@@ -382,7 +382,7 @@ def _route_event(event, deleted, changed) -> None:
             changed.append(canonical_path(getattr(event, "dest_path", "") or event.src_path))  # moved-into
 
 
-def start_fs_events(targets, wake, deleted=None, changed=None) -> Optional[Callable[[], None]]:
+def start_fs_events(targets, wake, deleted=None, changed=None) -> Callable[[], None] | None:
     """Subscribe to filesystem events under `targets` (native: ReadDirectoryChangesW on Windows,
     inotify on Linux, FSEvents on macOS — via `watchdog`) and set `wake` on ANY change so the loop
     reconciles immediately. Two exact-path fast-lanes (each a deque the loop drains): `deleted` gets
@@ -420,7 +420,7 @@ def start_fs_events(targets, wake, deleted=None, changed=None) -> Optional[Calla
 
 
 def _run_cycle(ctx: WatchContext, tuning: WatchTuning, *, busy: bool, deleted, full: bool,
-               scheduler: "_IngestScheduler", on_duplicate, on_detect) -> CycleResult:
+               scheduler: _IngestScheduler, on_duplicate, on_detect) -> CycleResult:
     """ONE reconcile cycle: removals ALWAYS (cheap event drain + optional `full` sweep); the HEAVY
     ingest only when no scan holds the lock (`busy` False). A failing cycle is caught here so the
     loop never dies (§2)."""
@@ -477,12 +477,12 @@ def _wait_next(wake, wait_s: float, sleep: Callable[[float], None]) -> bool:
     return False
 
 
-def watch_loop(ctx: WatchContext, *, tuning: Optional[WatchTuning] = None,
-               on_duplicate: Optional[Callable[[list], None]] = None,
-               on_cycle: Optional[Callable[[CycleResult], None]] = None,
-               on_detect: Optional[Callable[[int], None]] = None,
+def watch_loop(ctx: WatchContext, *, tuning: WatchTuning | None = None,
+               on_duplicate: Callable[[list], None] | None = None,
+               on_cycle: Callable[[CycleResult], None] | None = None,
+               on_detect: Callable[[int], None] | None = None,
                sleep: Callable[[float], None] = time.sleep,
-               wake=None, deleted=None, changed=None, stop: Optional[Callable[[], bool]] = None) -> None:
+               wake=None, deleted=None, changed=None, stop: Callable[[], bool] | None = None) -> None:
     """Reconcile until `stop()` returns True (or forever). EVENT-DRIVEN DELETIONS: when watchdog fills
     the `deleted` queue, each trash/move is forgotten in O(1) — the expensive O(library) `orphan_paths`
     sweep is demoted to a startup catch-up + a periodic backstop (`FULL_SWEEP_EVERY` idle cycles) for

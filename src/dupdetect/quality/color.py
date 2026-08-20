@@ -46,10 +46,10 @@ class ColorStats:
         return [self.clip, self.cast, self.saturation, self.contrast]
 
     @staticmethod
-    def from_list(v) -> "ColorStats":
+    def from_list(v) -> ColorStats:
         return ColorStats(*[float(x) for x in v]) if v is not None and len(v) >= 4 else ColorStats()
 
-    def grade_distance(self, other: "ColorStats") -> float:
+    def grade_distance(self, other: ColorStats) -> float:
         """Relative GRADE difference vs another copy (cast/saturation/contrast — NOT clipping).
         Used to flag 'color differs' so the user picks; >~0.15 means a visibly different look."""
         d = 0.0

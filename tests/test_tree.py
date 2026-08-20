@@ -9,8 +9,8 @@ import numpy as np
 import pytest
 
 from dupdetect.config import load_thresholds
-from dupdetect.models import AlignResult, Probe, Record, Verdict
 from dupdetect.match.tree import decide_tree
+from dupdetect.models import AlignResult, Probe, Record, Verdict
 
 
 def _rec(path: str, content_hash: str = "h", size: int = 100, n_cuts: int = 700) -> Record:

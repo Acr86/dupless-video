@@ -165,6 +165,7 @@ def test_pass2_load_safe_tolerates_missing_npy(tmp_path):
     missing/moved .npy must NOT crash it -> _load_safe falls back to a record with empty
     embeddings (video contributes 0; audio/scenes still decide), like the sequential cache path."""
     import numpy as np
+
     from dupdetect.match.matcher import _load_safe
     from dupdetect.models import Probe, Quality, Record
     from dupdetect.store import FingerprintStore
@@ -193,7 +194,7 @@ def test_align_video_pair_empty_embeddings_with_frame_times_no_crash():
     import numpy as np
 
     from dupdetect.config import load_thresholds
-    from dupdetect.match.matcher import _DictCache, _align_video_pair
+    from dupdetect.match.matcher import _align_video_pair, _DictCache
     from dupdetect.models import Probe, Quality, Record
 
     def _rec(p):
@@ -309,7 +310,7 @@ def test_align_video_pair_empty_torch_tensor_no_crash():
     import numpy as np
 
     from dupdetect.config import load_thresholds
-    from dupdetect.match.matcher import _DictCache, _align_video_pair
+    from dupdetect.match.matcher import _align_video_pair, _DictCache
     from dupdetect.models import Probe, Quality, Record
 
     def _rec(p):

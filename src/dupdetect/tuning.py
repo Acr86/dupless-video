@@ -142,7 +142,6 @@ def _is_network(path: str) -> bool:
     if os.name == "nt":
         return p.startswith("\\\\") or p.startswith("//")          # UNC path
     try:                                                            # POSIX: fstype from mount
-        dev = os.stat(path).st_dev
         with open("/proc/mounts", encoding="utf-8") as fh:
             best = ("", "")
             for line in fh:

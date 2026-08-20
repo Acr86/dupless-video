@@ -9,7 +9,7 @@ from __future__ import annotations
 import copy
 import csv
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -82,7 +82,7 @@ def compute_signals(pairs, store, embedder, th, cache=None) -> list[LabeledSigna
 
 
 def signal_for_pair(a: str, b: str, label: str, store, cache, th,
-                    genre: str = "") -> "LabeledSignal | None":
+                    genre: str = "") -> LabeledSignal | None:
     """Recompute for an ORPHAN pair (has feedback but NO row in `matches`): aligns from the
     ALREADY-saved fingerprints (audio_fp/scene_cuts from the record + embeddings from .npy via cache) — WITHOUT
     re-decoding from disk and WITHOUT the embedder. Returns None (skip-and-report) if a record or its .npy
@@ -206,7 +206,7 @@ def apply_thresholds_to_store(store, th: Thresholds, rebuild: bool = True) -> di
                              scenes_json=r["scenes_json"])
     clusters = 0
     if rebuild:
-        from dupdetect.pipeline.fullscan import _rebuild_clusters   # deferred: avoids import cycle
+        from dupdetect.pipeline.fullscan import _rebuild_clusters  # deferred: avoids import cycle
         clusters = len(_rebuild_clusters(store, th))
     return {"evaluated": evaluated, "changed": changed, "transitions": transitions,
             "skipped_no_signals": skipped_no_signals, "skipped_orphan": skipped_orphan,

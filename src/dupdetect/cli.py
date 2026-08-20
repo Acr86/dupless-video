@@ -210,7 +210,10 @@ def calibrate(
 ):
     """Evaluates thresholds against a labeled set and suggests theta_v/theta_a with ZERO FP in T1/T2."""
     from dupdetect.pipeline.calibrate import (
-        compute_signals, confusion_by_tier, load_pairs, suggest_thresholds,
+        compute_signals,
+        confusion_by_tier,
+        load_pairs,
+        suggest_thresholds,
     )
 
     th, store, embedder = _bootstrap(db, config)
@@ -360,7 +363,12 @@ def watch(
 
     from dupdetect.pipeline.fullscan import exact_scan
     from dupdetect.watch import (
-        CycleResult, WatchContext, WatchTuning, start_fs_events, watch_loop, watch_once,
+        CycleResult,
+        WatchContext,
+        WatchTuning,
+        start_fs_events,
+        watch_loop,
+        watch_once,
     )
 
     th, store, embedder = _bootstrap(db, config)
@@ -382,7 +390,7 @@ def watch(
         for cl in clusters:
             typer.echo(_fmt_dup(cl))
 
-    def _cycle(res: "CycleResult") -> None:
+    def _cycle(res: CycleResult) -> None:
         if res.indexed or res.removed or res.errors:
             from time import strftime
             typer.echo(f"[{strftime('%H:%M:%S')}] indexed={res.indexed} removed={res.removed} "

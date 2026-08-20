@@ -16,7 +16,7 @@ import os
 import shutil
 import sys
 from contextlib import contextmanager
-from functools import lru_cache
+from functools import cache
 from pathlib import Path
 
 APP_NAME = "Dupless Video"          # user-facing product name (data dir, installer, window title)
@@ -217,7 +217,7 @@ def _next_to_python(exe: str) -> str | None:
     return None
 
 
-@lru_cache(maxsize=None)
+@cache
 def resolve_binary(name: str) -> str:
     """Absolute path (or bare name as a last resort) of an external binary: ffmpeg/ffprobe/fpcalc.
 

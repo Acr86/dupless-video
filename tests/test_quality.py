@@ -6,11 +6,10 @@ we test the ISO mapping and extraction logic.
 """
 from __future__ import annotations
 
-import numpy as np
 import pytest
 
 from dupdetect.models import AudioTrack, Probe
-from dupdetect.quality.camrip import TARGET_BPP, cam_score
+from dupdetect.quality.camrip import cam_score
 
 torch = pytest.importorskip("torch")
 
@@ -129,6 +128,7 @@ def test_speech_window_clips_to_longest_segment(monkeypatch):
 # --------------------------------------------------------------- color descriptor
 def test_color_descriptor_detects_clipping_and_grade():
     import numpy as np
+
     from dupdetect.quality.color import ColorStats, color_descriptor
     clean = np.full((4, 16, 16, 3), 128, np.uint8)                  # mid-gray: no clipping
     assert color_descriptor(clean).clip < 0.01

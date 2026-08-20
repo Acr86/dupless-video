@@ -17,10 +17,10 @@ from dataclasses import asdict
 import numpy as np
 
 from dupdetect.align.audio import align_audio
-from dupdetect.features.audio_fp import audio_fingerprint
 from dupdetect.align.scenes import align_scenes
 from dupdetect.align.video import align_video, resample_to_grid
 from dupdetect.config import Thresholds
+from dupdetect.features.audio_fp import audio_fingerprint
 from dupdetect.match.cache import EmbeddingCache
 from dupdetect.match.retrieval import CoarseIndex
 from dupdetect.match.tree import decide_tree
@@ -389,6 +389,7 @@ def _drain_pairs_bounded(pool, pair_list, workers: int, progress: bool):
     -> memory O(workers), the pool never starves. wait(FIRST_COMPLETED) advances the bar on EVERY finish
     (any order), so one slow giant pair can't stall it (§2). Completion order is idempotent per pair (§0)."""
     from concurrent.futures import FIRST_COMPLETED, wait
+
     from tqdm import tqdm
     it = iter(pair_list)
     inflight: dict = {}                                # future -> pair

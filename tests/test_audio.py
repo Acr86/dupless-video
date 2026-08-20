@@ -13,7 +13,6 @@ from dupdetect.align.audio import ITEM_RATE_HZ, _popcount32, align_audio
 from dupdetect.features import audio_fp as afp
 from dupdetect.features.audio_fp import _parse_fpcalc
 
-
 # ------------------------------------------------------------- _parse_fpcalc
 
 def test_parse_fpcalc_large_uint32_values():

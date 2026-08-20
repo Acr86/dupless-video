@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
 
 import numpy as np
 
@@ -31,9 +30,9 @@ class Verdict(str, Enum):
 @dataclass
 class AudioTrack:
     index: int
-    lang_tag: Optional[str]              # declared tag (often wrong/empty)
-    codec: Optional[str] = None
-    channels: Optional[int] = None
+    lang_tag: str | None              # declared tag (often wrong/empty)
+    codec: str | None = None
+    channels: int | None = None
 
 
 @dataclass
@@ -43,7 +42,7 @@ class Probe:
     width: int
     height: int
     vcodec: str
-    bitrate_kbps: Optional[int]
+    bitrate_kbps: int | None
     audio_tracks: list[AudioTrack] = field(default_factory=list)
 
 
@@ -51,7 +50,7 @@ class Probe:
 class Quality:
     """Quality signals — INDEPENDENT of identity.
     C3: ad_offset does NOT live here; it is a property of the PAIR (AlignResult.offset / matches)."""
-    lang_detected: Optional[str] = None   # actual language (whisper-detect), not the tag
+    lang_detected: str | None = None   # actual language (whisper-detect), not the tag
     cam_score: float = 0.0                # 0..1, heuristic
     # Audio coverage [0..1]: 1.0 = full audio; <1 = missing/cut audio (a mute copy
     # must not be blindly chosen as KEEP -> user is warned). None = not computed yet (deferred:
@@ -59,7 +58,7 @@ class Quality:
     audio_coverage: float | None = 1.0
     # Color signals (latest stage): clipping is the objective KEEP signal (less = more detail
     # preserved); cast/saturation/contrast describe the grade -> only flag 'color differs'.
-    color: "ColorStats" = field(default_factory=lambda: ColorStats())
+    color: ColorStats = field(default_factory=lambda: ColorStats())
 
 
 @dataclass
@@ -114,6 +113,6 @@ class Result:
     verdict: Verdict
     confidence: float
     reason: str                           # tier + human-readable explanation
-    audio: Optional[AlignResult] = None
-    video: Optional[AlignResult] = None
-    scenes: Optional[AlignResult] = None
+    audio: AlignResult | None = None
+    video: AlignResult | None = None
+    scenes: AlignResult | None = None
