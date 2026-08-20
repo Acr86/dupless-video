@@ -1,0 +1,26 @@
+# Local gate mirroring CI — run `pre-commit install` once, then it runs on every commit.
+# Manual full run: `pre-commit run --all-files`.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files      # never commit the 2GB DB, installers or model weights
+        args: ["--maxkb=2048"]
+
+  # Style/lint — the same ruff rule set CI enforces (see pyproject [tool.ruff]).
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.6
+    hooks:
+      - id: ruff
+        args: ["--fix"]
+
+  # Secret scan — blocks a commit that would leak a credential/token/PII.
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks

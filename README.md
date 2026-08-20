@@ -1,6 +1,8 @@
 # Dupless Video
 
 [![tests](https://github.com/Acr86/dupless-video/actions/workflows/tests.yml/badge.svg)](https://github.com/Acr86/dupless-video/actions/workflows/tests.yml)
+[![CodeQL](https://github.com/Acr86/dupless-video/actions/workflows/codeql.yml/badge.svg)](https://github.com/Acr86/dupless-video/actions/workflows/codeql.yml)
+[![security](https://github.com/Acr86/dupless-video/actions/workflows/security.yml/badge.svg)](https://github.com/Acr86/dupless-video/actions/workflows/security.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 

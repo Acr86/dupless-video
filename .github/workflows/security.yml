@@ -1,0 +1,59 @@
+name: security
+
+# Two supply-chain / secret gates that complement CodeQL (which covers the code itself):
+#   - gitleaks : scans the git history and the diff for committed secrets / credentials / tokens.
+#                BLOCKING — a leaked secret is never acceptable (this repo's history was already
+#                scrubbed once for privacy; this keeps it that way).
+#   - pip-audit: checks installed dependencies against the PyPI advisory database (known CVEs).
+#                ADVISORY — a CVE in a transitive pin (torch, etc.) should surface loudly but must
+#                not block unrelated work until it can be triaged/upgraded.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "23 5 * * 1"   # weekly — new advisories land against dependencies that never changed
+  workflow_dispatch:
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  secrets:
+    name: secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # full history so a secret in any past commit is caught
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  dependencies:
+    name: dependency audit (pip-audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install project (CPU stack) + pip-audit
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install faiss-cpu av
+          pip install -e ".[dev,ui,watch]"
+          pip install pip-audit
+      - name: pip-audit (advisory)
+        continue-on-error: true          # a CVE informs; it does not block unrelated work
+        run: pip-audit --skip-editable --progress-spinner=off
