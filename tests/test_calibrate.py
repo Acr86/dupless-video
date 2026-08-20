@@ -69,6 +69,21 @@ def test_is_same_label():
     assert _sig("diff", 0, 0, 0, 0).is_same is False
 
 
+def test_suggest_refuses_one_sided_feedback(th):
+    """§0: a one-sided labelled set can't calibrate. With NO duplicate examples, recall is 0 for every
+    threshold, so the sweep's tie-break ('lowest threshold') would suggest a massive LOOSENING (real
+    case: 4 not-dup labels -> theta_v 0.5). Must report `degenerate` and leave thresholds UNCHANGED."""
+    only_diff = [_sig("diff", 0.1, 0.2, 0.1, 0.1), _sig("diff", 0.2, 0.3, 0.2, 0.1),
+                 _sig("diff", 0.9, 0.95, 0.9, 0.5), _sig("diff", 0.3, 0.4, 0.3, 0.2)]
+    sug = suggest_thresholds(only_diff, base=th)
+    assert sug["degenerate"] is True
+    assert sug["theta_v"] == th.theta_v and sug["theta_a"] == th.theta_a   # untouched
+    assert "not-duplicate" in sug["reason"] or "duplicate" in sug["reason"]
+
+    only_same = [_sig("dup", 0.9, 0.9, 0.95, 0.5)] * 4
+    assert suggest_thresholds(only_same, base=th)["degenerate"] is True    # symmetric case
+
+
 def test_verdict_of_t1(th):
     # strong audio+video with coverage -> CERTAIN
     assert verdict_of(_sig("dup", 0.9, 0.9, 0.95, 0.5), th) == Verdict.CERTAIN

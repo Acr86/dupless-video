@@ -36,7 +36,7 @@ from tqdm import tqdm
 from dupdetect.features.frames import decode_frames
 from dupdetect.features.hashing import content_hash
 from dupdetect.features.probe import ffprobe
-from dupdetect.match.tree import T0_REASON
+from dupdetect.match.tree import DECISION_VERSION, T0_REASON
 from dupdetect.quality.color import CLIP_DOWNGRADE_MARGIN, GRADE_DIVERGENCE
 from dupdetect.quality.language import detect_language
 from dupdetect.pipeline.analyze import (
@@ -44,6 +44,7 @@ from dupdetect.pipeline.analyze import (
     extract_gpu_features, feature_version, maybe_emit_viz, record_from_donor,
 )
 from dupdetect.store import FingerprintStore
+from dupdetect.store.store import canonical_pair
 
 
 def _short(path: str, n: int = 34) -> str:
@@ -358,7 +359,9 @@ def _scan_fingerprint(fv: str, th: Thresholds) -> str:
     plus ALL thresholds. Any change here can flip a verdict (e.g. looser θ turns a DIFFERENT into a
     match), so it keys the evaluated-pairs ledger -> a change invalidates every cached evaluation."""
     raw = json.dumps(th.raw, sort_keys=True, default=str)
-    return hashlib.blake2b(("%s\x00%s" % (fv, raw)).encode("utf-8", "surrogatepass"),
+    # DECISION_VERSION covers code-only changes to the tree that th.raw cannot see (a new guard/tier
+    # can flip a verdict for the same signals + thresholds) -> its bump invalidates the ledger too.
+    return hashlib.blake2b(("%s\x00%d\x00%s" % (fv, DECISION_VERSION, raw)).encode("utf-8", "surrogatepass"),
                            digest_size=16).hexdigest()
 
 
@@ -385,8 +388,8 @@ def _pass2(paths, store, index, th, progress, evaluated=None, changed=None, fing
 def _classify(verdict, a, b, reason, conf, review, editions) -> None:
     if verdict in REVIEW_VERDICTS:
         review.append((a, b, reason, conf))
-    elif verdict == Verdict.DIFFERENT_EDITION:
-        editions.append((a, b, reason))
+    elif verdict in (Verdict.DIFFERENT_EDITION, Verdict.CONTAINS):
+        editions.append((a, b, reason))          # "related, not duplicates" (Part 2 splits the types)
 
 
 def _on_disk(p: str, seen: dict[str, bool]) -> bool:
@@ -519,8 +522,12 @@ def _rebuild_clusters(store: FingerprintStore, th: Thresholds, reuse: Optional[d
     member's data may have changed (re-encode) and ranking must be fresh."""
     reuse = reuse or {}
     uf = UnionFind()
+    # A user "not a duplicate" veto OUTRANKS the content verdict: never union a vetoed pair. This is
+    # what makes a corrected group STAY corrected — a re-scan re-aligns and would happily re-declare
+    # the pair CERTAIN, but the veto lives in `feedback` and is re-applied on every rebuild.
+    vetoed = store.vetoed_pairs()
     for a, b, verdict in store.all_matches():
-        if verdict in _DUPLICATE_VALUES:
+        if verdict in _DUPLICATE_VALUES and canonical_pair(a, b) not in vetoed:
             uf.union(a, b)
     rows, clusters_out = [], []
     # Ranking each group runs the DEFERRED whisper + audio coverage per member -> a long, formerly

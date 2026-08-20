@@ -13,6 +13,14 @@ from dupdetect.models import AlignResult, Record, Result, Verdict
 # `clusters` and `matches` tables in sync (see ui.data.drift_report).
 T0_REASON = "T0 sampled hash identical (verify byte-exact before deleting)"
 
+# Version of the decision LOGIC (tiers/guards), bumped whenever decide_tree can flip a verdict for the
+# SAME stored signals + thresholds — e.g. a new guard/tier. The incremental ledger (pipeline.fullscan.
+# _scan_fingerprint) folds this in, so a logic change invalidates cached evaluations and a re-scan
+# re-decides every pair. Thresholds already key the ledger via th.raw; this covers code-only changes
+# (which th.raw cannot see). Bump on any semantic change here.
+#   2 -> added the CONTAINS guard (coverage_long): clip-in-compilation no longer clusters.
+DECISION_VERSION = 2
+
 
 def _cut_density(rec: Record) -> float:
     """Scene cuts per second. A coarse signature (low density — SEEK-sampled giants) is not
@@ -20,6 +28,42 @@ def _cut_density(rec: Record) -> float:
     dur = rec.probe.duration_s or 0.0
     n = len(rec.scene_cuts) if rec.scene_cuts is not None else 0
     return (n / dur) if dur > 0 else 0.0
+
+
+def _coverage_long(a: Record, b: Record, video: AlignResult) -> float:
+    """Fraction of the LONGER file that aligns: `video.coverage` measures only the SHORTER (path/min),
+    so scale it by the duration ratio. Low -> the shorter is a SEGMENT inside the longer (a clip in a
+    compilation), not a mutual duplicate. Unknown duration -> falls back to coverage (won't fire)."""
+    da = a.probe.duration_s or 0.0
+    db = b.probe.duration_s or 0.0
+    mx = max(da, db)
+    return video.coverage * (min(da, db) / mx) if mx > 0 else video.coverage
+
+
+def _structural_verdict(a: Record, b: Record, video: AlignResult, th: Thresholds, disc: bool):
+    """A relationship that is NOT a duplicate: a different EDITION (contiguous superset) or CONTAINS
+    (a short clip aligned inside a long compilation). Returns (verdict, confidence, reason) or None.
+    Kept out of decide_tree so the tier list stays flat. Neither verdict is in DUPLICATE_VERDICTS, so
+    union-find never groups these -> the root fix for compilation chain-fusion."""
+    if disc and video.score >= th.theta_v and video.contiguous_superset:
+        return (Verdict.DIFFERENT_EDITION, min(0.90, video.score),
+                f"different edition: contiguous superset (+{video.extra_ratio:.0%} runtime)")
+    if video.score >= th.theta_v and video.coverage >= th.min_coverage:
+        cov_long = _coverage_long(a, b, video)
+        if cov_long < th.min_coverage_long:
+            return (Verdict.CONTAINS, min(0.85, video.score),
+                    f"contains: shorter aligns (cov {video.coverage:.2f}) but longer mostly unmatched "
+                    f"(cov_long {cov_long:.2f})")
+    return None
+
+
+def _discriminative(a: Record, b: Record, th: Thresholds) -> bool:
+    """Is there enough CONTENT to trust a strong 'same video' verdict (edition/T1/T2/T3)? A very short
+    clip (a few seconds of a near-static scene) has non-discriminative video — any two such clips align
+    at ~1.0 — so a strong tier must NOT fire on it; the pair falls through to T4b (review). Same idea as
+    the min_cut_density guard on the scenes-only tier. Measured from the SHORTER runtime (probe, §0)."""
+    dur = min(a.probe.duration_s or 0.0, b.probe.duration_s or 0.0)
+    return dur >= th.min_strong_duration_s
 
 
 def decide_tree(
@@ -44,21 +88,25 @@ def decide_tree(
     if a.content_hash == b.content_hash and a.size == b.size:
         return make(Verdict.CERTAIN, 1.00, T0_REASON)
 
-    # ---- GUARD edition vs duplicate (before declaring dup) -------------
-    # If video aligns strongly but 'b' is a contiguous superset of 'a' (or vice versa),
-    # it is a different edition (director's cut), NOT a junk duplicate.
-    if video.score >= th.theta_v and video.contiguous_superset:
-        return make(
-            Verdict.DIFFERENT_EDITION,
-            min(0.90, video.score),
-            f"different edition: contiguous superset (+{video.extra_ratio:.0%} runtime)",
-        )
+    # Enough content to trust a strong 'same video' verdict? Very short near-static clips are not
+    # discriminative (phone burst clips of the same subject all align ~1.0) -> such pairs skip the
+    # strong tiers below and fall to T4b (review). T0 above is byte-identity, unaffected.
+    disc = _discriminative(a, b, th)
+
+    # ---- GUARD: structural relationship (edition / contains), NOT a duplicate -----
+    # A different EDITION (contiguous superset) or CONTAINS (a short clip aligned INSIDE a long
+    # compilation). Both must exit BEFORE the duplicate tiers so union-find never fuses a long file's
+    # unrelated neighbours through it. See _structural_verdict.
+    struct = _structural_verdict(a, b, video, th, disc)
+    if struct is not None:
+        return make(*struct)
 
     # ---- T1: confirmed by TWO independent modalities -------------------
     # Coverage required: Smith-Waterman selects the most similar frames, so
     # a high score over a tiny path (cov ~0.04 between different films) is NOT
     # "strong video". (Audio is already auto-gated by min_overlap in align_audio.)
-    if audio.score >= th.theta_a and video.score >= th.theta_v and video.coverage >= th.min_coverage:
+    if (disc and audio.score >= th.theta_a and video.score >= th.theta_v
+            and video.coverage >= th.min_coverage):
         return make(
             Verdict.CERTAIN, 0.99,
             f"T1 audio({audio.score:.2f})+video({video.score:.2f}, cov {video.coverage:.2f}) agree",
@@ -67,7 +115,8 @@ def decide_tree(
     # ---- T2: same video, audio does NOT align => different dub ----------
     # Where Plex falls short. Audio MUST NOT align (otherwise it would be T1).
     if (
-        video.score >= th.theta_v_high
+        disc
+        and video.score >= th.theta_v_high
         and video.coverage >= th.min_coverage
         and audio.score < th.theta_a_low
     ):
@@ -77,7 +126,8 @@ def decide_tree(
         )
 
     # ---- T3: partial video corroborated by scene structure -------------
-    if video.score >= th.theta_v and video.coverage >= th.min_coverage and scenes.score >= th.theta_s:
+    if (disc and video.score >= th.theta_v and video.coverage >= th.min_coverage
+            and scenes.score >= th.theta_s):
         return make(
             Verdict.HIGH, 0.88,
             f"T3 video({video.score:.2f}, cov {video.coverage:.2f}) + scenes({scenes.score:.2f})",

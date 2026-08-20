@@ -396,6 +396,39 @@ def test_build_problem_model_detail_not_checkable(monkeypatch):
     assert [p for p, _ in checked_problems(m)] == ["/x/big.mkv"]
 
 
+def test_split_selected_keeps_them_grouped_together(tmp_path, monkeypatch):
+    """Ticking a wrongly-FUSED sub-group splits it off INTACT: vetoes are recorded only against the
+    rest of the cluster, so the selected files stay grouped with each other (shattering them into
+    singletons would destroy a real duplicate relation)."""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PySide6")
+    from collections import defaultdict
+
+    from PySide6.QtWidgets import QApplication
+
+    from dupdetect.config import load_thresholds
+    from dupdetect.pipeline.fullscan import _rebuild_clusters
+    from dupdetect.ui.main import MainWindow
+    db = tmp_path / "split.sqlite"
+    st = FingerprintStore(db)
+    for p in ("/m1.mkv", "/m2.mkv", "/s1.mkv", "/s2.mkv"):
+        st.save(_rec(p), feature_version="fv")
+    st.save_match("/m1.mkv", "/m2.mkv", "CERTAIN", 0.99, "T1")     # real pair
+    st.save_match("/m2.mkv", "/s1.mkv", "CERTAIN", 0.99, "T1")     # the WRONG link that fused them
+    st.save_match("/s1.mkv", "/s2.mkv", "CERTAIN", 0.99, "T1")     # real sub-group
+    _rebuild_clusters(st, load_thresholds())
+    assert len({r[0] for r in st.conn.execute("SELECT cluster_id FROM clusters")}) == 1  # all fused
+    st.close()
+
+    QApplication.instance() or QApplication([])
+    w = MainWindow(str(db))
+    w._split_from_group(["/s1.mkv", "/s2.mkv"])                    # both don't belong -> split TOGETHER
+    g = defaultdict(set)
+    for cid, p in w.store.conn.execute("SELECT cluster_id, path FROM clusters"):
+        g[cid].add(p)
+    assert sorted(sorted(s) for s in g.values()) == [["/m1.mkv", "/m2.mkv"], ["/s1.mkv", "/s2.mkv"]]
+
+
 def test_mainwindow_populates_problem_tabs(tmp_path, monkeypatch):
     """The window distributes problems into its two trees, sets the count in the tab title,
     and enables Rebuild only when there are repairable entries."""

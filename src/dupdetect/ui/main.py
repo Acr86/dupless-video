@@ -139,7 +139,8 @@ class MainWindow(QMainWindow):
         self._persisted: set = set()                    # trees restored from a previous session
         self._prune_worker: _PruneWorker | None = None  # background disk reconcile (one at a time)
         self._audio_worker: _AudioFixWorker | None = None   # background audio re-check/override
-        self.setWindowTitle(f"Dupless Video · Duplicates — {db_path}")
+        from dupdetect import __version__
+        self.setWindowTitle(f"Dupless Video {__version__}")   # no DB path in the title (privacy + noise)
         _icon = Path(__file__).with_name("icon.ico")
         if _icon.exists():
             self.setWindowIcon(QIcon(str(_icon)))
@@ -167,9 +168,16 @@ class MainWindow(QMainWindow):
         btn_clean = QPushButton("🧹 Clean missing")
         btn_clean.setToolTip("Remove files deleted outside the app from this list. "
                              "Offline drives are skipped (never mistaken for a deletion).")
+        # Short label on purpose: this row is right-aligned, so every extra pixel pushes the LAST
+        # button (Delete) off a narrow window. The tooltip carries the full explanation.
+        btn_split = QPushButton("✂ Split off")
+        btn_split.setToolTip("Tick the file(s) that DON'T belong to their group, then press this.\n"
+                             "They leave the group immediately and are never grouped with it again\n"
+                             "(ticking several keeps THEM together as their own group).")
+        btn_split.clicked.connect(lambda: self._split_from_group([p for p, _ in checked_files(self.model)]))
         bottom = QHBoxLayout()
         bottom.addWidget(self.sel_lbl); bottom.addStretch(1)
-        for b in (btn_clean, btn_recal, btn_vlc, btn_del):
+        for b in (btn_clean, btn_split, btn_recal, btn_vlc, btn_del):
             bottom.addWidget(b)
 
         self.scan_panel = ScanPanel(db_path)
@@ -364,7 +372,8 @@ class MainWindow(QMainWindow):
             self._db_path = db
             self._settings.setValue("db_path", db)       # remember the active DB across sessions
             self.watch_panel.set_db(db)                  # watcher follows the active DB
-            self.setWindowTitle(f"Dupless Video · Duplicates — {db}")
+            from dupdetect import __version__
+            self.setWindowTitle(f"Dupless Video {__version__}")   # switch_db: keep the DB path OUT of the title
         self._refresh_with_prune()                       # new DB: reconcile its list with disk too
 
     def _refresh_with_prune(self):
@@ -787,7 +796,7 @@ class MainWindow(QMainWindow):
         a_master = menu.addAction("★ Set as master (keep this)")
         a_master.setEnabled(cid is not None and path != keep)       # already master -> nothing to do
         menu.addSeparator()
-        a_diff = menu.addAction("✗ Not a duplicate (false positive)")
+        a_diff = menu.addAction("✗ Not the same — remove from this group")
         a_same = menu.addAction("✓ Confirm it is a duplicate")
         # Feedback labels the pair (★ master, COPY). On the ★ itself there is no pair ->
         # disable (previously a SILENT no-op: appeared to save but saved nothing).
@@ -811,16 +820,52 @@ class MainWindow(QMainWindow):
             self._reveal_cluster(int(cid))                          # sort by reclaimable changes when
             #                                                       # the KEEP moves -> the cluster jumps
             #                                                       # position; keep it in view (not "gone")
-        elif act in (a_diff, a_same) and keep and keep != path:
-            self.store.save_feedback(keep, path, "different" if act is a_diff else "same")
-            self.statusBar().showMessage(
-                f"Feedback saved ({'not-dup' if act is a_diff else 'dup'}). Use ⚙ Recalibrate to apply.", 5000)
+        elif act is a_diff and keep and keep != path:
+            self._split_from_group([path])                  # applies NOW (leaves the group) + persists
+        elif act is a_same and keep and keep != path:
+            self.store.save_feedback(keep, path, "same")    # positive label; also lifts any veto
+            self.statusBar().showMessage("Marked as a real duplicate (also feeds ⚙ Recalibrate).", 5000)
         elif act is not None and act is a_restore:
             self._audio_fix("restore", [path])
         elif act is not None and act is a_recheck:
             self._audio_fix("recheck", [path])
         elif act is not None and act is a_mark:
             self._audio_fix("override", [path])
+
+    def _split_from_group(self, paths: list[str]) -> None:
+        """"These don't belong to their group": veto each selected file against the REST of its cluster
+        and rebuild, so the group visibly splits RIGHT NOW (before, the feedback was only stored for a
+        future ⚙ Recalibrate and nothing appeared to happen).
+
+        Links AMONG the selected files are deliberately NOT vetoed: ticking the members of a wrongly
+        fused sub-group splits them off TOGETHER, instead of shattering them into singletons and losing
+        a real duplicate relation. The veto lives in `feedback`, so a later re-scan can't undo it."""
+        if not paths:
+            _mbox(self, "Nothing selected",
+                  "Tick the file(s) that don't belong to their group (or right-click one).")
+            return
+        sel = set(paths)
+        vetoed = 0
+        for p in paths:
+            row = self.store.conn.execute(
+                "SELECT cluster_id FROM clusters WHERE path=?", (p,)).fetchone()
+            if row is None:
+                continue                                   # not in a group (already split) -> nothing
+            for other in (r[0] for r in self.store.conn.execute(
+                    "SELECT path FROM clusters WHERE cluster_id=?", (row[0],))):
+                if other != p and other not in sel:        # keep the ticked ones grouped together
+                    self.store.save_feedback(p, other, "different")
+                    vetoed += 1
+        if not vetoed:
+            self.statusBar().showMessage("Nothing to split (those files aren't grouped).", 4000)
+            return
+        from dupdetect.config import load_thresholds
+        from dupdetect.pipeline.fullscan import _rebuild_clusters, _snapshot_clusters
+        prior = _snapshot_clusters(self.store)             # reuse ranking of untouched clusters (fast)
+        _rebuild_clusters(self.store, load_thresholds(), reuse=prior)
+        self.refresh()
+        self._toast(f"{len(paths)} file(s) removed from their group — they won't be grouped with it "
+                    f"again. Undo with “✓ Confirm it is a duplicate”.")
 
     def _audio_fix(self, mode: str, paths: list[str]) -> None:
         """Dispatch an audio-quality correction ('recheck' | 'override' | 'restore') to the
@@ -887,6 +932,16 @@ class MainWindow(QMainWindow):
         n_same = sum(1 for s in sigs if s.is_same)
         orphan_note = (f"\n({n_feedback - n_usable} unrecoverable — re-scan to restore)"
                        if n_usable < n_feedback else "")
+        if sug.get("degenerate"):
+            # One-sided feedback can't calibrate: with no duplicates labelled, recall is 0 for every
+            # threshold and the sweep would "optimize" by LOOSENING everything (§0). Refuse, explain.
+            _mbox(self, "Recalibrate — not enough variety",
+                  f"{n_usable} usable of {n_feedback} feedback "
+                  f"({n_same} dup, {n_usable - n_same} not-dup).{orphan_note}\n\n"
+                  f"Can't calibrate: {sug['reason']}.\n\n"
+                  "Right-click a real duplicate and choose “✓ Confirm it is a duplicate” so the "
+                  "thresholds have positive examples too. Thresholds left unchanged.")
+            return
         text = (f"{n_usable} usable of {n_feedback} feedback ({n_same} dup, {n_usable-n_same} not-dup)."
                 f"{orphan_note}\n\n"
                 f"Suggested:  θv → {sug['theta_v']}    θa → {sug['theta_a']}\n"

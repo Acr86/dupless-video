@@ -236,6 +236,41 @@ def test_rebuild_clusters_from_global_graph(th, store):
     assert groups == [["/a.mkv", "/b.mkv"], ["/c.mkv", "/d.mkv"]]
 
 
+def test_contains_edge_does_not_fuse_clusters(th, store):
+    """Root fix for compilation chain-fusion: a CONTAINS edge (a clip is a segment inside a long
+    compilation) must NOT union files. So a compilation that contains clip C, while also being a real
+    duplicate of A, does NOT drag C into A's group."""
+    for n in ("/a.mkv", "/b_comp.mkv", "/c_clip.mkv"):
+        store.save(_rec(n), feature_version=FV)
+    store.save_match("/a.mkv", "/b_comp.mkv", "CERTAIN", 0.99, "T1")            # real duplicate
+    store.save_match("/b_comp.mkv", "/c_clip.mkv", "CONTAINS", 0.85, "contains")  # b contains c
+    groups = sorted(sorted([c["keep"], *c["discard"]]) for c in _rebuild_clusters(store, th))
+    assert groups == [["/a.mkv", "/b_comp.mkv"]]                    # c_clip NOT fused via the CONTAINS edge
+
+
+def test_user_veto_splits_cluster_and_survives_rescan(th, store):
+    """A user 'not a duplicate' veto OUTRANKS the content verdict: the vetoed pair is never unioned,
+    so the group splits — and it STAYS split when a later scan re-declares the pair CERTAIN (the veto
+    lives in `feedback`, re-applied on every rebuild). Marking it 'same' again lifts the veto."""
+    for n in ("/a.mkv", "/b.mkv", "/c.mkv"):
+        store.save(_rec(n), feature_version=FV)
+    store.save_match("/a.mkv", "/b.mkv", "CERTAIN", 0.99, "T1")
+    store.save_match("/b.mkv", "/c.mkv", "CERTAIN", 0.99, "T1")     # chain -> a,b,c one component
+    assert len(_rebuild_clusters(store, th)) == 1                   # one group of 3
+
+    store.save_feedback("/b.mkv", "/c.mkv", "different")            # user: c doesn't belong
+    out = _rebuild_clusters(store, th)
+    groups = sorted(sorted([c["keep"], *c["discard"]]) for c in out)
+    assert groups == [["/a.mkv", "/b.mkv"]]                         # c split off (singleton dropped)
+
+    store.save_match("/b.mkv", "/c.mkv", "CERTAIN", 0.99, "T1")     # a re-scan re-declares it
+    groups = sorted(sorted([c["keep"], *c["discard"]]) for c in _rebuild_clusters(store, th))
+    assert groups == [["/a.mkv", "/b.mkv"]]                         # veto still holds
+
+    store.save_feedback("/b.mkv", "/c.mkv", "same")                 # user changes their mind
+    assert len(_rebuild_clusters(store, th)[0]["discard"]) == 2     # regrouped: 3 members again
+
+
 def test_rebuild_clusters_leaves_no_stale_rows(th, store):
     """Regression: a re-scan that changes membership must NOT leave a file in two
     clusters. The entire table is rebuilt from the global match graph."""

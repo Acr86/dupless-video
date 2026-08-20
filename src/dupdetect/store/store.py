@@ -662,6 +662,14 @@ class FingerprintStore:
         return [(r["a_path"], r["b_path"], r["label"])
                 for r in self.conn.execute("SELECT a_path, b_path, label FROM feedback")]
 
+    def vetoed_pairs(self) -> set[tuple[str, str]]:
+        """Canonical pairs the USER marked 'different' — a human veto that outranks the content
+        verdict: cluster building must NEVER union them, so a corrected group stays corrected across
+        re-scans (a re-scan re-aligns and would otherwise re-declare them duplicates). Marking the
+        pair 'same' again upserts the label and lifts the veto."""
+        return {(r["a_path"], r["b_path"]) for r in self.conn.execute(
+            "SELECT a_path, b_path FROM feedback WHERE label = 'different'")}
+
     def record_deletion(self, path: str, dest: str, size: int) -> None:
         """Audits a deletion made from the UI (traceability / undo from Recycle Bin)."""
         self.conn.execute(

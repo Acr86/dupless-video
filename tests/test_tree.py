@@ -57,6 +57,26 @@ def test_t2_different_dub(th):
     assert "dub" in r.reason
 
 
+def test_short_clip_video_identical_goes_to_review_not_strong(th):
+    # T2 conditions (video identical, audio doesn't align) BUT the clips are ~2s — too short to be
+    # discriminative (phone burst clips of the same static scene all align ~1.0). Must NOT be VERY_HIGH;
+    # falls to T4b review. This is the burst-clip false-positive guard (min_strong_duration_s).
+    a, b = _rec("a", "x"), _rec("b", "y")
+    a.probe.duration_s = 2.0
+    b.probe.duration_s = 2.0
+    r = decide_tree(a, b, AlignResult(0.1), AlignResult(0.95, coverage=0.95), AlignResult(0.2), th)
+    assert r.verdict == Verdict.PROBABLE and "T4b" in r.reason
+
+
+def test_short_clip_byte_identical_still_certain(th):
+    # T0 (byte-identity) is BEFORE the discriminative guard: true byte-copies of a short clip are still
+    # CERTAIN (the guard only blocks the content-similarity tiers, not identity).
+    a, b = _rec("a", "same", 100), _rec("b", "same", 100)
+    a.probe.duration_s = 2.0
+    b.probe.duration_s = 2.0
+    assert decide_tree(a, b, AlignResult(0), AlignResult(0), AlignResult(0), th).verdict == Verdict.CERTAIN
+
+
 def test_t4_scenes_only_goes_to_review(th):
     a, b = _rec("a", "x"), _rec("b", "y")           # dense cut signature (default) -> trusted
     r = decide_tree(a, b, AlignResult(0.1), AlignResult(0.3, coverage=0.3),
@@ -121,6 +141,29 @@ def test_t5_different_files(th):
     a, b = _rec("a", "x"), _rec("b", "y")
     r = decide_tree(a, b, AlignResult(0.1), AlignResult(0.2), AlignResult(0.2), th)
     assert r.verdict == Verdict.DIFFERENT
+
+
+def test_contains_clip_in_compilation_is_not_a_duplicate(th):
+    # A 100s clip aligns fully (coverage 0.99) INSIDE a 2000s compilation -> coverage_long ~0.05 <<
+    # min_coverage_long -> CONTAINS (a relationship), NOT a duplicate. This is the root fix that stops a
+    # compilation from fusing its unrelated neighbours into one giant cluster (CONTAINS never clusters).
+    a, b = _rec("a", "x"), _rec("b", "y")
+    a.probe.duration_s = 100.0
+    b.probe.duration_s = 2000.0
+    r = decide_tree(a, b, AlignResult(0.1), AlignResult(0.9, coverage=0.99), AlignResult(0.5), th)
+    assert r.verdict == Verdict.CONTAINS
+    from dupdetect.match.tree import DUPLICATE_VERDICTS
+    assert Verdict.CONTAINS not in DUPLICATE_VERDICTS         # never grouped -> no chain fusion
+
+
+def test_similar_duration_full_match_stays_a_duplicate(th):
+    # Both ~2000s and coverage 0.99 -> coverage_long ~0.97 (both files mostly aligned) -> a REAL
+    # duplicate (T1), NOT CONTAINS. The guard must not demote true re-encodes of similar length.
+    a, b = _rec("a", "x"), _rec("b", "y")
+    a.probe.duration_s = 2000.0
+    b.probe.duration_s = 1950.0
+    r = decide_tree(a, b, AlignResult(0.9), AlignResult(0.9, coverage=0.99), AlignResult(0.5), th)
+    assert r.verdict == Verdict.CERTAIN
 
 
 def test_different_edition_is_not_duplicate(th):

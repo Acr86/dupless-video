@@ -147,10 +147,12 @@ def labeled_signals_from_feedback(store, th=None, cache=None) -> list[LabeledSig
 
 
 def _mk(path: str, h: str) -> Record:
-    """Minimal Record for decide_tree (only uses path/content_hash/size; distinct hashes
-    => never triggers T0, which doesn't depend on thresholds)."""
+    """Minimal Record for decide_tree (uses path/content_hash/size for T0, and duration for the
+    discriminative guard). Distinct hashes => never T0. Duration is a long/typical runtime: the labeled
+    calibration pairs are real full-length content, so the min_strong_duration_s guard must not treat
+    them as tiny non-discriminative clips (that guard targets seconds-long burst clips, not the set)."""
     return Record(
-        path=path, mtime=0.0, size=hash(h) & 0xFFFF, probe=Probe(0, 0, 0, "", None),
+        path=path, mtime=0.0, size=hash(h) & 0xFFFF, probe=Probe(3600.0, 0, 0, "", None),
         content_hash=h, global_vec=np.zeros(1, np.float32), window_vecs=np.zeros((0, 1), np.float32),
         embeddings=np.zeros((0, 1), np.float16), audio_fp=np.zeros(0, np.uint32),
         scene_cuts=np.zeros(0, np.float32), quality=Quality(),
@@ -273,11 +275,36 @@ def _recall(signals, th) -> float:
     return caught / len(same)
 
 
+# At least one example of EACH label. With ZERO of a class the corresponding metric is CONSTANT across
+# the whole sweep (no positives -> recall always 0; no negatives -> FP always 0), so the tie-break
+# collapses to "lowest threshold" and the routine suggests a loosening. One example already makes the
+# metric vary, which is what the sweep needs (the UI separately requires >=4 usable labels in total).
+MIN_PER_CLASS = 1
+
+
 def suggest_thresholds(signals: list[LabeledSignal], base: Thresholds | None = None,
                        grid: list[float] | None = None) -> dict:
     """Sweeps (theta_v, theta_a) and picks the combination giving ZERO FP in T1/T2, then MAX recall.
-    Returns the suggestion + the resulting confusion matrix."""
+    Returns the suggestion + the resulting confusion matrix.
+
+    DEGENERATE GUARD (§0 — never loosen on a one-sided set): the sweep ranks candidates by
+    (fewest FP, most recall, LOWEST threshold). With no POSITIVE examples recall is 0 for every
+    combination, so the tie-break collapses to "pick the lowest threshold" and the routine happily
+    suggests a massive loosening (measured: 4 not-dup labels -> theta_v 0.5 / theta_a 0.7, recall 0.0).
+    Symmetrically, with no NEGATIVE examples FP is 0 everywhere. Either way the set can't calibrate
+    anything: return `degenerate` with the thresholds UNCHANGED so the caller refuses instead of
+    applying a harmful suggestion."""
     base = base or load_thresholds()
+    n_same = sum(1 for s in signals if s.is_same)
+    n_diff = len(signals) - n_same
+    if n_same < MIN_PER_CLASS or n_diff < MIN_PER_CLASS:
+        return {
+            "degenerate": True, "n_same": n_same, "n_diff": n_diff, "n_pairs": len(signals),
+            "theta_v": base.theta_v, "theta_a": base.theta_a,          # unchanged
+            "false_positives_T1T2": None, "recall_dup": None, "confusion": {},
+            "reason": (f"need at least {MIN_PER_CLASS} of EACH label to calibrate "
+                       f"(have {n_same} duplicate, {n_diff} not-duplicate)"),
+        }
     grid = grid or [round(0.50 + 0.05 * i, 2) for i in range(10)]   # 0.50..0.95
     best = None
     for tv in grid:
@@ -291,8 +318,9 @@ def suggest_thresholds(signals: list[LabeledSignal], base: Thresholds | None = N
     fp, neg_rec, tv, ta = best
     chosen = _th_override(base, tv, ta)
     return {
+        "degenerate": False,
         "theta_v": tv, "theta_a": ta,
         "false_positives_T1T2": fp, "recall_dup": round(-neg_rec, 3),
         "confusion": confusion_by_tier(signals, chosen),
-        "n_pairs": len(signals),
+        "n_pairs": len(signals), "n_same": n_same, "n_diff": n_diff,
     }

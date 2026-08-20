@@ -99,6 +99,26 @@ class Thresholds:
     def max_offset_s(self) -> float:
         return float(self.raw["video"]["max_offset_s"])
 
+    @property
+    def min_coverage_long(self) -> float:
+        """Minimum fraction of the LONGER file that must align for a DUPLICATE verdict. `coverage`
+        alone only measures the SHORTER file (path/min), so a clip that aligns fully INSIDE a long
+        compilation reads coverage~1.0 and looks like a strong duplicate — while the compilation is
+        mostly unmatched. Requiring the longer file to also be mostly aligned (coverage_long = coverage
+        * min_dur/max_dur >= this) separates a real duplicate (both ~fully aligned) from a CONTAINS
+        relationship (short segment inside a long file). Below it -> Verdict.CONTAINS (not clustered).
+        Content-derived (§0); the contiguous-superset/edition case is handled separately, before this."""
+        return float(self.raw.get("video", {}).get("min_coverage_long", 0.5))
+
+    @property
+    def min_strong_duration_s(self) -> float:
+        """Minimum runtime (of the SHORTER file) for a STRONG same-content verdict (edition/T1/T2/T3).
+        Below this the video is too short to be discriminative — a few seconds of a near-static scene
+        aligns with any other such clip (phone burst clips of the same subject), so the pair falls to
+        T4b (review) instead of a false CERTAIN/VERY_HIGH. Mirrors the min_cut_density guard on the
+        scenes-only tier. Content-derived from the probe (§0)."""
+        return float(self.raw.get("video", {}).get("min_strong_duration_s", 15.0))
+
     # --- audio_fp: length + per-file timeouts (avoid waste on large/broken files) ---
     @property
     def audio_fp_cap_s(self) -> int:

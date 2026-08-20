@@ -12,7 +12,7 @@
 ; in-app toggle uses (startup.py), so they never conflict.
 
 #define AppName "Dupless Video"
-#define AppVersion "0.1.2"
+#define AppVersion "0.1.3"
 #define AppPublisher "Dupless Video"
 #define AppExeName "Dupless Video.exe"
 

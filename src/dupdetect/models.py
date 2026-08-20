@@ -23,6 +23,9 @@ class Verdict(str, Enum):
     PROBABLE = "PROBABLE"                 # T4 -> review queue
     DIFFERENT = "DIFFERENT"               # T5
     DIFFERENT_EDITION = "DIFFERENT_EDITION"  # contiguous superset (director's cut)
+    CONTAINS = "CONTAINS"                 # the shorter is a SEGMENT inside the longer (clip in a
+    #                                       # compilation): a relationship, NOT a duplicate -> never
+    #                                       # clustered (would fuse the long file's unrelated neighbours)
 
 
 @dataclass

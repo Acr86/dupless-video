@@ -11,6 +11,58 @@ Newest on top. Append-only in spirit. Deep rationale for the design invariants l
 
 ## Entries
 
+### Mega-cluster persisted after the CONTAINS fix — a POISONED per-user thresholds override (θv 0.5)
+- **Symptom:** after shipping the CONTAINS guard (entry below) a fresh Standard scan STILL produced a
+  1338-member cluster (down from 1621, so CONTAINS worked — 31k CONTAINS rows emitted — but something
+  else kept fusing).
+- **Root cause (config, NOT code):** `%LOCALAPPDATA%\Dupless Video\thresholds.yaml` — the per-user
+  override that `effective_config_path()` prefers in the frozen app — held **θv 0.5 / θa 0.55**
+  (shipped: 0.75 / 0.80), written by the old degenerate recalibration (one-sided feedback, recall 0.0)
+  before the MIN_PER_CLASS guard existed. Proof from the DB: **3855/4796 (80%) strong-tier rows had
+  video < 0.75** (e.g. `T1 audio(0.56)+video(0.60)`). Same-genre pairs at video 0.5–0.7 flooded
+  T1/T3 → union-find fused them. Timeline matched exactly: override mtime 2026-07-18, first "detection
+  broke" report right after.
+- **Recovery (app pipeline, no re-scan):** stored `audio_json/video_json/scenes_json` make re-deciding
+  cheap → `actions.apply_thresholds(0.75, 0.80, config_path=<override>, store=…)` (the same function
+  behind Recalibrate→Apply) re-decided all 344k matches in ~21 min and rebuilt clusters. Result:
+  DIFFERENT 40→319,963 · PROBABLE 280k→20,665 · CONTAINS 31k→1,589 · HIGH 3,456→36 · strong rows with
+  video<0.75 = **0** · biggest cluster **1338 → 4 members** (1,217 clusters / 2,506 files). DB backed
+  up first (`dupdetect.sqlite.bak-20260722`).
+- **Prevention (already shipped in 0.1.3):** `suggest_thresholds` refuses degenerate label sets
+  (missing class → `degenerate: True`, thresholds untouched) and the UI explains instead of applying.
+- **Lesson:** when detection quality "suddenly regresses", check `effective_config_path()` FIRST —
+  a stale per-user override silently outranks the shipped defaults in the frozen app, and no code
+  diff will explain it. The DB `reason` strings carry the scores → grep them against the shipped θ
+  to prove/disprove a loose-threshold episode in minutes.
+
+### Mega-cluster of unrelated videos — a compilation chain-fuses its neighbours (CONTAINS guard)
+- **Symptom:** a Standard scan produced a 1621-member "duplicate" cluster of unrelated videos (also
+  32- and 19-member ones). Quality dropped sharply vs the prior build.
+- **Root cause (NOT a loose threshold — §0 held):** clusters are built by union-find over duplicate
+  matches, i.e. a *partition*. But the data is a *graph*: a compilation legitimately shares scene X with
+  video_02 and scene Y with video_05. Each such pair aligned as a strong tier (video≈0.9, cov≈0.99 —
+  because `coverage` = path/`min(na,nb)`, it measures only the SHORTER file, so a clip that sits fully
+  inside a long compilation reads cov≈1.0 and looks like a duplicate). Union-find then fuses the
+  compilation with its unrelated neighbours, and each neighbour drags in *its* neighbours → one giant
+  blob. The compilation is the hub.
+- **Fix (a fork, approved — new relationship type, not a looser tier):** a new signal
+  `coverage_long = coverage * min_dur/max_dur` = the fraction of the LONGER file that aligns (valid
+  because `resample_to_grid` makes frame counts ∝ duration). When video aligns strongly and `coverage`
+  is high but `coverage_long < min_coverage_long` (0.5) → `Verdict.CONTAINS` (see
+  `match/tree.py::_structural_verdict`). CONTAINS is NOT in `DUPLICATE_VERDICTS` nor `REVIEW_VERDICTS`,
+  so union-find never groups it and it never floods review — it is a *relationship*, surfaced (Part 2)
+  as "related, not duplicates" alongside DIFFERENT_EDITION. A real duplicate (both files ~fully aligned)
+  keeps `coverage_long≈coverage` → unchanged. §0 intact: the guard only *demotes* (never promotes) and
+  fires before the strong tiers.
+- **Ledger gotcha:** the incremental `evaluated_pairs` ledger keyed only on `feature_version + th.raw`,
+  so a code-only change to the tree (this guard) would NOT invalidate cached evaluations → a normal
+  re-scan would skip these pairs and never reclassify them. Added `tree.DECISION_VERSION` (bump on any
+  verdict-flipping logic change) folded into `_scan_fingerprint`. To reclassify an already-scanned
+  library: re-scan (the ledger now misses on the version bump), or Force-recompute to be certain.
+- **Tests:** `test_tree.py::test_contains_clip_in_compilation_is_not_a_duplicate`,
+  `::test_similar_duration_full_match_stays_a_duplicate`,
+  `test_fullscan.py::test_contains_edge_does_not_fuse_clusters` (the CONTAINS edge must not union).
+
 ### Healthy files flagged "NO AUDIO / audio truncated" (false quality warnings) — probe v2 + user fixes
 - **Symptom:** files that play fine (audio present) show in Quality warnings / carry the per-copy ⚠,
   blocking auto-KEEP on their clusters; nothing in the UI could correct it (the tab was triage-only)
@@ -302,6 +354,55 @@ Newest on top. Append-only in spirit. Deep rationale for the design invariants l
   `test_watch.py::test_pending_files_skips_unchanged_corrupt`,
   `test_fullscan.py::test_needs_analysis_skips_unchanged_corrupt`. Ships in the next build (the running
   tray watcher is the frozen .exe).
+
+### Burst clips grouped as duplicates — different recordings of the same static scene (T2 FP)
+- **Symptom:** a folder of phone clips (`Fotos/Por_fecha`, 1–3 s, 1440p) all fused into ~2 huge
+  "duplicate" groups across DIFFERENT timestamps (4.09.35 ↔ 4.09.38 ↔ 4.09.43…). Measured: 730
+  cross-timestamp pairs at **VERY_HIGH**, video.score 0.85–1.00, audio 0.0.
+- **Root cause:** these are different recordings of a near-static scene, so their video aligns ~1.0.
+  **T2** ("video identical + audio doesn't align ⇒ same video, different dub") fired — but a 2-second,
+  4-frame static clip has NON-discriminative video (any two clips of the same wall align). The tree
+  already guards the scenes-only tier with `min_cut_density`, but the STRONG video tiers (edition/T1/
+  T2/T3) had NO discriminative-content check. NOT a clustering/id bug (union-find over real matches);
+  NOT this session's lazy-audio/ranking work — the matches came from the earlier scan.
+- **Resolution (approved §0 fork):** `_discriminative(a, b, th)` gates edition/T1/T2/T3 on
+  `min(dur_a, dur_b) >= th.min_strong_duration_s` (default 15 s). Below it the pair falls to T4b →
+  review (the doubt path), never a strong duplicate. T0 (byte-identity) is unaffected. Re-validated:
+  the labeled calibration set is full-length content (durations ≫ 15 s) → 0-FP / recall unchanged; the
+  calibration `_mk` stub's `Probe(0,…)` was bumped to a real duration so the guard doesn't misread it.
+- **Files / refs:** `match/tree.py` (`_discriminative`, gates); `config.py` (`min_strong_duration_s`);
+  `pipeline/calibrate.py` (`_mk` duration); tests `test_tree.py` (short-clip → review, byte-identical
+  short → still CERTAIN). Reprocess without re-align: `apply_thresholds_to_store` re-decides stored
+  signals with the new tree. NOTE: true short `-Copy(N)` copies also drop to review (also short); the
+  name-grouping doesn't yet promote them back (it respects the existing PROBABLE) — open follow-up.
+
+### "Not a duplicate" did nothing — and Recalibrate offered to LOOSEN everything
+- **Symptom:** (a) marking a file "not a duplicate" left the group unchanged; (b) the Recalibrate dialog
+  proposed `θv 0.5 / θa 0.7` with `recall = 0.0` from 4 labels (all not-dup, 17 orphaned).
+- **Root cause (a):** the only consumer of `feedback` was `calibrate.labeled_signals_from_feedback` —
+  the button just stored a row for a future GLOBAL threshold sweep. The schema's "view overrides" did
+  not exist. Worse, the label is PAIR-scoped (KEEP↔file) while a cluster is a union-find COMPONENT
+  (measured: a real cluster had 5 of 6 possible edges), so cutting one edge often leaves the file in
+  the group via a transitive path — hence "nothing happens".
+- **Root cause (b):** `suggest_thresholds` ranks by `(fewest FP, most recall, LOWEST threshold)`. With
+  no POSITIVE labels, recall is 0 for every combination, so the tie-break collapses to "pick the lowest
+  threshold" → a massive loosening (§0 says recall comes from the review queue, never from loosening).
+- **Resolution:** (a) `store.vetoed_pairs()` (feedback rows labelled `different`) is now honoured by
+  `_rebuild_clusters`, which NEVER unions a vetoed pair — so a corrected group stays corrected even
+  after a re-scan re-declares the pair CERTAIN. The UI's `_split_from_group` vetoes each selected file
+  against the REST of its cluster (links AMONG the selected are kept, so a fused sub-group splits off
+  intact), rebuilds with `reuse=` and refreshes, so the change is visible immediately; `✓ Confirm it is
+  a duplicate` upserts the label and lifts the veto. (b) `suggest_thresholds` returns `degenerate` with
+  thresholds UNCHANGED unless BOTH labels are present (`MIN_PER_CLASS`); the UI explains instead of
+  offering Apply.
+- **UI wording:** "✗ Not a duplicate (false positive)" (a jargon LABEL) → "✗ Not the same — remove from
+  this group" (states the EFFECT), plus a bulk "✂ Not the same — split off" that reuses the existing
+  tick-boxes, matching the established "tick rows → bottom button" pattern of Delete/VLC.
+- **Files / refs:** `store.py` (`vetoed_pairs`); `pipeline/fullscan.py` (`_rebuild_clusters` veto);
+  `pipeline/calibrate.py` (`MIN_PER_CLASS`, degenerate return); `ui/main.py` (`_split_from_group`,
+  menu/button); tests in `test_fullscan.py`, `test_ui.py`, `test_calibrate.py`.
+- **Open:** a cluster is a connected component, so a chain A~B~C can still present as "3 copies ·
+  CERTAIN" without A≁C being checked — requiring (near-)clique-ness would attack that root cause.
 
 ### Phantom duplicate records: same file under '/' and '\' paths (Windows)
 - **Symptom:** the DB shows the SAME file twice (inflated index, even a file "duplicate" of itself).
