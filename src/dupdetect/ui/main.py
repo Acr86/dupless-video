@@ -674,10 +674,16 @@ class MainWindow(QMainWindow):
             lbl.setText(f"Checked: {len(files)} · {_gb(total)}")
 
     def _on_problem_double(self, idx):
-        """Double-click on a problem file node -> open in VLC (detail rows are ignored)."""
+        """Double-click a problem file node: the Folder column copies the full path, any other column
+        opens it in VLC (detail rows are ignored)."""
         it = idx.model().itemFromIndex(idx.siblingAtColumn(0))
-        if it is not None and it.data(KIND_ROLE) == "problem":
-            actions.open_in_vlc(it.data(PATH_ROLE))
+        if it is None or it.data(KIND_ROLE) != "problem":
+            return
+        p = it.data(PATH_ROLE)
+        if idx.model().headerData(idx.column(), Qt.Horizontal) == "Folder":
+            self._copy_path(p)
+        else:
+            actions.open_in_vlc(p)
 
     def _vlc_paths(self, paths: list[str]) -> None:
         if not paths:
@@ -770,11 +776,25 @@ class MainWindow(QMainWindow):
         for path, _ in files[:8]:                       # cap to avoid opening 50 windows
             actions.open_in_vlc(path)
 
+    def _copy_path(self, path: str) -> None:
+        """Copy a full file path to the clipboard (double-click on the Path/Folder column)."""
+        QApplication.clipboard().setText(path)
+        self._toast(f"Path copied: {os.path.basename(path)}")
+
     def _on_double(self, idx):
-        if self.model.itemFromIndex(idx).data(KIND_ROLE) == "file":
-            p = self.model.itemFromIndex(idx.siblingAtColumn(0)).data(PATH_ROLE)
-            if p:
-                actions.open_in_vlc(p)
+        # KIND/PATH roles live on column 0 only, so read them from the row's first cell (not the clicked
+        # cell) -> a double-click on ANY column of a file row works. Path column copies the full path;
+        # any other column opens it in VLC.
+        row0 = self.model.itemFromIndex(idx.siblingAtColumn(0))
+        if row0 is None or row0.data(KIND_ROLE) != "file":
+            return
+        p = row0.data(PATH_ROLE)
+        if not p:
+            return
+        if idx.model().headerData(idx.column(), Qt.Horizontal) == "Path":
+            self._copy_path(p)
+        else:
+            actions.open_in_vlc(p)
 
     def _focused_file(self):
         idx = self.tree.currentIndex()

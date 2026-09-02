@@ -158,6 +158,47 @@ def test_is_actionable():
     assert not is_actionable(_cl(0, [], "PROBABLE"))
 
 
+def test_double_click_path_column_copies_full_path(tmp_path, monkeypatch):
+    """Double-click on the Path column copies the full file path; any other column opens VLC. KIND/PATH
+    roles live on column 0, so the handler must read the row's first cell, not the clicked one."""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+
+    import dupdetect.ui.main as _m
+    from dupdetect.config import load_thresholds
+    from dupdetect.pipeline.fullscan import _rebuild_clusters
+    from dupdetect.ui.main import MainWindow
+    monkeypatch.setattr(_m, "_mbox", lambda *a, **k: 0)
+    monkeypatch.setattr(FingerprintStore, "prune_missing_files", lambda self: 0)
+    opened: list[str] = []
+    monkeypatch.setattr(_m.actions, "open_in_vlc", lambda p: opened.append(p))
+
+    db = tmp_path / "dc.sqlite"
+    st = FingerprintStore(db)
+    for p in ("/a.mkv", "/b.mkv"):
+        st.save(_rec(p), feature_version="fv")
+    st.save_match("/a.mkv", "/b.mkv", "CERTAIN", 0.99, "T1")
+    _rebuild_clusters(st, load_thresholds())
+    st.close()
+
+    QApplication.instance() or QApplication([])
+    w = MainWindow(str(db))
+    copied: list[str] = []
+    monkeypatch.setattr(w, "_copy_path", lambda p: copied.append(p))
+    file_item = w.model.invisibleRootItem().child(0).child(0)     # first file under the first cluster
+    base = w.model.indexFromItem(file_item)
+    headers = [w.model.horizontalHeaderItem(c).text() for c in range(w.model.columnCount())]
+
+    w._on_double(base.siblingAtColumn(headers.index("Path")))     # Path column -> copy
+    assert copied and copied[-1] in ("/a.mkv", "/b.mkv")
+    assert opened == []                                           # did NOT open VLC
+    w._on_double(base.siblingAtColumn(0))                         # name column -> VLC
+    assert opened
+    w._really_quit = True
+    w.close()
+
+
 def test_scan_panel_guard_blocks_start_while_rebuilding(tmp_path, monkeypatch):
     """The scan<->rebuild guard: when pre_start_check returns a message (a rebuild is running), the
     panel must NOT launch a scan subprocess."""
