@@ -11,6 +11,29 @@ Newest on top. Append-only in spirit. Deep rationale for the design invariants l
 
 ## Entries
 
+### Index rebuild: no visible progress off its tab, and it could race a scan (0.1.5)
+- **Symptom:** rebuilding a video's index showed no progress from other tabs ("nothing indicates it's
+  moving"); and the user asked whether rebuild could run concurrently with the duplicate scan.
+- **Answer on concurrency (NO):** both are I/O-bound on the same disk (the library/NAS), so running
+  them together thrashes and is slower than sequential (§1, HDD optimum ~1-2 readers); the remux also
+  WRITES each file, and it replaces the file atomically — a scan reading it mid-remux would analyze a
+  file that's about to change (stale, must redo). They're sequential by design: rebuild → the next scan
+  picks the fixed files up. So the fix is visibility + chaining + a guard, not parallelism.
+- **Root cause of the invisible progress:** the rebuild's bar/status (`rx_progress`/`rx_status`) live
+  INSIDE the "Indexes to rebuild" tab, so switching tabs hid them (the scan panel is a shared bottom
+  block, which is why it stayed visible).
+- **Fix (0.1.5):**
+  - **A (global progress):** mirror the rebuild progress into the status bar (`sb_rx` + `showMessage`),
+    visible from any tab.
+  - **B (chain):** on rebuild finish, if ≥1 file was repaired, auto-start the configured library scan
+    (`ScanPanel.start_if_idle`) — incremental, so only the rebuilt files re-analyze, matched against the
+    whole index. One flow instead of "rebuild, then remember to re-scan".
+  - **C (guard):** rebuild refuses to start while a scan runs (`scan_panel.is_running()` /
+    `runtime.scan_in_progress()`), and the scan panel refuses while a rebuild runs (a `pre_start_check`
+    hook the window wires to `_repair_running()`). The `repair-indexes` CLI now also holds
+    `scan_priority_lock()` so the watcher yields and other processes see it as a scan-in-progress.
+- **Tests:** `test_ui.test_scan_panel_guard_blocks_start_while_rebuilding`. ruff clean; suite 345.
+
 ### UI freezes ~30s on "Clean missing" during a scan — refresh scans the whole `matches` table (×2)
 - **Symptom:** clicking "Clean missing" (or ↻) while a scan is matching froze the window for ~30s.
 - **Root cause (two compounding):**

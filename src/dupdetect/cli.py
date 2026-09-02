@@ -287,27 +287,32 @@ def repair_indexes(
               f"total_gb={total_bytes / 1e9:.1f} file={Path(path).name}", flush=True)
 
     ok = fail = gone = 0
-    for idx, (p, _err, _cat, _note) in enumerate(items, start=1):
-        name = Path(p).name
-        _emit(idx, p, 0.0, force=True)                            # marks the start of this file
-        good, kind, msg = remux_rebuild_index(
-            p, on_progress=lambda f, _i=idx, _p=p: _emit(_i, _p, f))
-        done_bytes += sizes.get(p, 0)
-        if good:
-            store.clear_problem(p)                 # success -> next run checks it
-            ok += 1
-            typer.echo(f"  ✓ {name}")
-        elif kind == "gone":
-            store.clear_problem(p)                 # no longer exists -> forget it (self-heal)
-            gone += 1
-            typer.echo(f"  · {name}: {msg} (olvidado)")
-        else:
-            # PERSIST the result: 'timeout' remains repairable (retryable), any other kind
-            # becomes unrecoverable with the reason -> stops being retried blindly.
-            store.mark_repair_failed(p, kind, msg)
-            fail += 1
-            typer.echo(f"  ✗ {name}: {msg}  [{kind}]")
-        _sys.stdout.flush()
+    # Hold the scan priority lock for the whole remux: it is as disk-heavy as a scan (reads+writes each
+    # file), so the watcher yields (scan_in_progress) and the UI guard blocks starting a scan meanwhile
+    # (running both thrashes the disk, and a remux changes a file mid-analysis). A `with` adds no scope,
+    # so done_bytes/ok/fail below stay the same function locals.
+    with scan_priority_lock():
+        for idx, (p, _err, _cat, _note) in enumerate(items, start=1):
+            name = Path(p).name
+            _emit(idx, p, 0.0, force=True)                            # marks the start of this file
+            good, kind, msg = remux_rebuild_index(
+                p, on_progress=lambda f, _i=idx, _p=p: _emit(_i, _p, f))
+            done_bytes += sizes.get(p, 0)
+            if good:
+                store.clear_problem(p)                 # success -> next run checks it
+                ok += 1
+                typer.echo(f"  ✓ {name}")
+            elif kind == "gone":
+                store.clear_problem(p)                 # no longer exists -> forget it (self-heal)
+                gone += 1
+                typer.echo(f"  · {name}: {msg} (olvidado)")
+            else:
+                # PERSIST the result: 'timeout' remains repairable (retryable), any other kind
+                # becomes unrecoverable with the reason -> stops being retried blindly.
+                store.mark_repair_failed(p, kind, msg)
+                fail += 1
+                typer.echo(f"  ✗ {name}: {msg}  [{kind}]")
+            _sys.stdout.flush()
     extra = f", {gone} olvidado(s)" if gone else ""
     typer.echo(f"\nReconstruidos {ok}, fallaron {fail}{extra}. "
                "Re-scan to check the rebuilt files as duplicates.")

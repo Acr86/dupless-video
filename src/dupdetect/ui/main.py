@@ -380,6 +380,15 @@ class MainWindow(QMainWindow):
         _ver.setStyleSheet("color: gray;")
         _ver.setToolTip("Dupless Video version")
         self.statusBar().addPermanentWidget(_ver)
+        # Index-rebuild progress lives in the status bar too, so it's visible from ANY tab (the in-tab
+        # bar shows only on the reindex tab -> switching away looked frozen). Hidden until a rebuild runs.
+        self.sb_rx = QProgressBar(); self.sb_rx.setMaximumWidth(220); self.sb_rx.hide()
+        self.statusBar().addPermanentWidget(self.sb_rx)
+        # Guard: a scan must not start while a rebuild runs — both are disk-heavy and a remux changes a
+        # file mid-analysis (§0/§1). The rebuild guards the reverse in _repair_indexes.
+        self.scan_panel.pre_start_check = lambda: (
+            "An index rebuild is running — wait for it to finish (both use the disk)."
+            if self._repair_running() else None)
         self._refresh_with_prune()                      # on open: paint now, reconcile with disk in bg
         QTimer.singleShot(0, self._maybe_onboard)       # one-time intro (after the window is shown)
         if startup.is_enabled() and self.watch_panel.folder.text().strip():
@@ -976,6 +985,11 @@ class MainWindow(QMainWindow):
             self._toast(f"Thresholds updated and re-applied to existing results — {p}")
 
     # --------------------------------------------------- indexes to rebuild / corrupted
+    def _repair_running(self) -> bool:
+        """True while the index-rebuild subprocess is active (for the scan<->rebuild guard)."""
+        p = getattr(self, "_repair_proc", None)
+        return bool(p and p.state() != QProcess.NotRunning)
+
     def _repair_indexes(self):
         """Rebuilds listed indexes via remux (through the CLI, in a subprocess, without freezing
         the UI). No re-encode -> verdict unchanged; afterwards, re-scan picks them up.
@@ -983,6 +997,13 @@ class MainWindow(QMainWindow):
         live in the other tab -> never selectable for repair."""
         n = len(problem_paths(self.reindex_model)) if self.reindex_model is not None else 0
         if not n:
+            return
+        # Guard (C): never rebuild while a scan runs — both hammer the disk and a remux mutates a file
+        # mid-analysis. Covers this window's scan (is_running) and any other process/instance (the lock).
+        if self.scan_panel.is_running() or runtime.scan_in_progress():
+            _mbox(self, "Rebuild indexes",
+                  "A scan is in progress — wait for it to finish before rebuilding indexes "
+                  "(both hit the disk; running them together thrashes and can corrupt a mid-scan read).")
             return
         if _mbox(
                 self, "Rebuild indexes",
@@ -996,6 +1017,7 @@ class MainWindow(QMainWindow):
         self.rx_progress.setRange(0, 0)                  # "busy" (marquee) until the first %
         self.rx_progress.show()
         self.rx_status.setText("Starting…"); self.rx_status.show()
+        self.sb_rx.setRange(0, 0); self.sb_rx.show()     # A: mirror in the status bar (visible on any tab)
         self._rx_hb.start()                              # clock -> never appears frozen (§2)
         prog, argv, pythonpath = runtime.cli_subprocess(
             ["repair-indexes", "--db", self._db_path, "--apply"])    # frozen .exe vs python -m (dev)
@@ -1030,6 +1052,9 @@ class MainWindow(QMainWindow):
             if self.rx_progress.maximum() == 0:
                 self.rx_progress.setRange(0, 100)
             self.rx_progress.setValue(int(opct))
+            if self.sb_rx.maximum() == 0:
+                self.sb_rx.setRange(0, 100)
+            self.sb_rx.setValue(int(opct))
             self._rx_status_base = (
                 f"Rebuilding {idx}/{total} · {fpct}% {fname} · {dgb}/{tgb} GB · "
                 f"ETA {_fmt_eta(int(eta))}")
@@ -1042,15 +1067,24 @@ class MainWindow(QMainWindow):
     def _render_repair(self):
         base = getattr(self, "_rx_status_base", "Working…")
         mm, ss = divmod(self._rx_elapsed, 60)
-        self.rx_status.setText(f"{base}   ·   ⏱ {mm:d}:{ss:02d}")
+        text = f"{base}   ·   ⏱ {mm:d}:{ss:02d}"
+        self.rx_status.setText(text)
+        self.statusBar().showMessage(f"🔧 {text}")       # A: visible from any tab
 
     def _repair_done(self, *_):
         self._rx_hb.stop()
         self.rx_progress.hide(); self.rx_status.hide()
-        self.btn_repair.setText("🔧 Rebuild indexes")
+        self.sb_rx.hide(); self.statusBar().clearMessage()
+        self.btn_repair.setText("🔧 Rebuild indexes")   # refresh() below re-enables it per remaining items
         out = "\n".join(self._repair_log[-40:]) or "Done."
         _mbox(self, "Index rebuild", out)
         self.refresh()                                  # repaint tabs (repaired items disappear)
+        # B: chain a re-scan so the rebuilt files are analyzed and matched as duplicates. Incremental —
+        # only the changed (repaired) files get Pass-1'd, matched against the whole index. Guard C keeps
+        # this from overlapping (the rebuild is finished now, so the scan can take the disk).
+        repaired = sum(1 for ln in self._repair_log if ln.startswith("✓"))
+        if repaired and self.scan_panel.start_if_idle():
+            self._toast(f"Rebuilt {repaired} file(s) — re-scanning the library to detect their duplicates…")
 
     def _open_corrupt_folder(self):
         self._open_folders(self._checked_problem_paths(self.corrupt_model))

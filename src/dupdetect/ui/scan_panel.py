@@ -73,6 +73,10 @@ class ScanPanel(QGroupBox):
     def __init__(self, db_path: str, parent=None):
         super().__init__("Analyze library", parent)
         self.proc: QProcess | None = None
+        # Optional guard set by the window: returns an error message if a scan must NOT start now (e.g. an
+        # index rebuild is running — both hit the disk), or None to allow. Keeps the rebuild<->scan guard
+        # in one place without ScanPanel knowing about the window's repair process.
+        self.pre_start_check = None
         self._viz = None                                 # lazy "What the AI sees" window
         self._elapsed = 0
         self._phase_text = "Listo."                      # last known status (the clock is appended to it)
@@ -188,6 +192,19 @@ class ScanPanel(QGroupBox):
         if d:
             self.folder.setText(d)
 
+    def is_running(self) -> bool:
+        """True while a scan subprocess is active (used by the rebuild<->scan guard)."""
+        return bool(self.proc and self.proc.state() != QProcess.NotRunning)
+
+    def start_if_idle(self) -> bool:
+        """Start the configured library scan if one isn't already running and a folder is set. Used to
+        CHAIN a re-scan after an index rebuild (incremental: only the rebuilt files get re-analyzed,
+        matched against the whole index). Returns True if it launched."""
+        if self.is_running() or not self.folder.text().strip():
+            return False
+        self._toggle()
+        return self.is_running()
+
     def _toggle(self):
         if self.proc and self.proc.state() != QProcess.NotRunning:
             self._stop()
@@ -196,6 +213,11 @@ class ScanPanel(QGroupBox):
         if not folder:
             self.status.setText("Pick a folder first (Browse…).")
             return
+        if self.pre_start_check is not None:
+            msg = self.pre_start_check()
+            if msg:
+                self.status.setText(msg)
+                return
         args = ["scan", folder,
                 "--db", self.db.text().strip(),
                 f"--workers={self.workers.value()}",            # 0 = Auto; '=' prevents -1 (decode)

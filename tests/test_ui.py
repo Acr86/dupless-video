@@ -158,6 +158,22 @@ def test_is_actionable():
     assert not is_actionable(_cl(0, [], "PROBABLE"))
 
 
+def test_scan_panel_guard_blocks_start_while_rebuilding(tmp_path, monkeypatch):
+    """The scan<->rebuild guard: when pre_start_check returns a message (a rebuild is running), the
+    panel must NOT launch a scan subprocess."""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+
+    from dupdetect.ui.scan_panel import ScanPanel
+    QApplication.instance() or QApplication([])
+    sp = ScanPanel(str(tmp_path / "d.sqlite"))
+    sp.folder.setText(str(tmp_path))
+    sp.pre_start_check = lambda: "An index rebuild is running — wait for it to finish."
+    assert sp.start_if_idle() is False        # guard refuses -> no launch
+    assert sp.is_running() is False           # and no subprocess was spawned
+
+
 def test_drift_report_detects_desync(store):
     """clusters and matches over DISJOINT paths (e.g. exact_scan after full_scan) -> drifted.
     If they share paths (clusters derived from matches) -> not drifted."""
