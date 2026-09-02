@@ -565,6 +565,26 @@ class FingerprintStore:
         """All indexed paths (full or lite). For name-based grouping."""
         return [r["path"] for r in self.conn.execute("SELECT path FROM files")]
 
+    def relocate_path(self, old: str, new: str) -> None:
+        """Rename a file's path old->new across the store, KEEPING its analysis (the features and their
+        .npy survive — emb_path is unchanged). For a MOVED or RE-MOUNTED file (same content, new mount
+        prefix like M:\\ -> /share): the ONE record follows the active path instead of being orphaned —
+        an orphan under the same content_hash+size would be a T0 'duplicate of itself'. The file's own
+        MATCHES are dropped (its duplicate edges are re-derived cheaply by the next Pass-2 in the same
+        scan); clusters/problems/overrides/feedback are re-pointed. OR REPLACE guards the rare case where
+        `new` already carried a (stale) row."""
+        if old == new:
+            return
+        c = self.conn
+        c.execute("UPDATE OR REPLACE files SET path=? WHERE path=?", (new, old))
+        c.execute("DELETE FROM matches WHERE a_path=? OR b_path=?", (old, old))
+        c.execute("DELETE FROM clusters WHERE path=?", (old,))
+        c.execute("UPDATE OR REPLACE problems SET path=? WHERE path=?", (new, old))
+        c.execute("UPDATE OR REPLACE quality_overrides SET path=? WHERE path=?", (new, old))
+        c.execute("UPDATE OR REPLACE feedback SET a_path=? WHERE a_path=?", (new, old))
+        c.execute("UPDATE OR REPLACE feedback SET b_path=? WHERE b_path=?", (new, old))
+        c.commit()
+
     def delete_match(self, a: str, b: str, commit: bool = True) -> None:
         """Remove ONE pair's row (canonicalized). Used when a pair RE-DECIDES to DIFFERENT: DIFFERENT is
         never kept in `matches` (schema), so a prior duplicate/review row must be dropped, not left to

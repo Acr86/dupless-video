@@ -162,6 +162,13 @@ def record_from_donor(cpu: CpuFeatures, store: FingerprintStore, fv: str):
     donor_path = store.find_by_hash(cpu.content_hash, fv, size=cpu.size)
     if donor_path is None:
         return None
+    # If the donor's OWN file is gone, this is the SAME file moved / re-mounted (M:\ -> /share), not a
+    # second copy: rename the record to follow it so ONE record tracks the file (an orphan under the same
+    # content_hash+size would be a T0 duplicate of itself). A real duplicate (donor still on disk) is
+    # left as-is and cloned below. §0-safe: gated on the byte identity (content_hash+size), not the path.
+    if donor_path != cpu.path and not os.path.exists(donor_path):
+        store.relocate_path(donor_path, cpu.path)
+        donor_path = cpu.path
     try:
         donor = store.load(donor_path, with_embeddings=True)
     except OSError:                                # orphaned/moved .npy -> can't donate embeddings

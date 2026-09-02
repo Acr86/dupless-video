@@ -11,6 +11,30 @@ Newest on top. Append-only in spirit. Deep rationale for the design invariants l
 
 ## Entries
 
+### Same library under two mounts (PC M:\ vs NAS /share) — one record follows the active mount
+- **Need:** the library moved to a NAS; the user wants the SAME DB usable under both the PC's `M:\`
+  mount and a NAS `/share` path, sharing the analysis, without re-scanning and without the same file
+  being flagged as a duplicate of itself.
+- **Design decision (a fork, approved):** identity is by BYTES, not by path (§0 — a path is metadata
+  that can lie). We already had `find_by_hash(content_hash, size)` + the M4 clone (`record_from_donor`):
+  a byte-identical file at a new path reuses features without re-embed, reading only the sampled hash.
+  Added the missing half: when the donor's OWN file is GONE (`not os.path.exists(donor_path)`), the new
+  path is the SAME file moved / re-mounted — so `store.relocate_path(old, new)` RENAMES the record to
+  follow it (one record, no orphan) instead of cloning and leaving an orphan that T0 would call a
+  self-duplicate. A donor still on disk = a genuine second copy → cloned as before.
+- **relocate_path:** renames the file across `files`/`problems`/`quality_overrides`/`feedback` (features
+  and their .npy survive — emb_path is unchanged) and DROPS the file's own `matches`/`clusters`; those
+  edges are re-derived cheaply by the same scan's Pass-2. Runs in the main process (`_gpu_finish` /
+  `analyze_file`), safe to write.
+- **Not yet (follow-ups, gated on the NAS decision):** (1) a suffix+size FAST-PATH to skip even the
+  sampled-hash read on a whole-library re-mount; (2) cross-OS open-time prune (M:\ paths seen from
+  Linux) — the relocate covers reuse during a scan, prune-before-scan may need the mount-aware guard
+  extended; (3) the pipelined decode path (decode-workers>1) still decodes (M4 short-circuit is
+  serial-only, pre-existing).
+- **Tests:** `test_store.test_relocate_path_follows_a_moved_file`,
+  `test_pipeline.test_analyze_file_relocates_moved_donor`; the two M4 tests now pin their donor ON disk
+  (a real copy → clone) so they exercise the clone path, not the new relocate path.
+
 ### Index rebuild: no visible progress off its tab, and it could race a scan (0.1.5)
 - **Symptom:** rebuilding a video's index showed no progress from other tabs ("nothing indicates it's
   moving"); and the user asked whether rebuild could run concurrently with the duplicate scan.

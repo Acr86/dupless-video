@@ -385,7 +385,8 @@ def test_analyze_file_clones_byte_identical_donor(tmp_path, monkeypatch):
     store = FingerprintStore(tmp_path / "m4.sqlite")
     th = load_thresholds()
     fv = _fv(th)
-    donor = _donor_rec("/lib/orig.mkv")
+    orig = tmp_path / "orig.mkv"; orig.write_bytes(b"x")   # donor PRESENT on disk -> a real copy (clone, not a move)
+    donor = _donor_rec(str(orig))
     store.save(donor, feature_version=fv)
     store.conn.execute("UPDATE files SET audio_coverage=NULL WHERE path=?", (donor.path,))
     store.conn.commit()
@@ -422,7 +423,8 @@ def test_record_from_donor_requires_size_and_embeddings(tmp_path):
     store = FingerprintStore(tmp_path / "m4b.sqlite")
     th = load_thresholds()
     fv = _fv(th)
-    donor = _donor_rec("/lib/orig.mkv")
+    orig = tmp_path / "orig.mkv"; orig.write_bytes(b"x")   # donor PRESENT -> a duplicate gate, not a move
+    donor = _donor_rec(str(orig))
     store.save(donor, feature_version=fv)
 
     def cpu(size):
@@ -438,6 +440,39 @@ def test_record_from_donor_requires_size_and_embeddings(tmp_path):
     store.conn.execute("UPDATE files SET emb_path=NULL WHERE path=?", (donor.path,))
     store.conn.commit()
     assert analyze.record_from_donor(cpu(donor.size), store, fv) is None
+    store.close()
+
+
+def test_analyze_file_relocates_moved_donor(tmp_path, monkeypatch):
+    """A byte-identical donor whose OWN file is GONE = the SAME file moved / re-mounted (M:\\ -> /share),
+    not a second copy: the record RELOCATES to the new path (one record follows the mount) instead of
+    leaving an orphan that T0 would flag as a duplicate of itself. Features kept; decode skipped."""
+    from dupdetect.pipeline import analyze
+    store = FingerprintStore(tmp_path / "reloc.sqlite")
+    th = load_thresholds()
+    fv = _fv(th)
+    donor = _donor_rec("/gone/orig.mkv")                   # never created on disk -> 'moved away'
+    store.save(donor, feature_version=fv)
+    store.save_match(donor.path, "/other.mkv", "CERTAIN", 0.99, "T1")   # an edge to drop on relocate
+
+    moved = tmp_path / "moved.mkv"; moved.write_bytes(b"x")
+    st = moved.stat()
+
+    def fake_cpu(path, independent_scenes=False):
+        return analyze.CpuFeatures(
+            path=str(moved), mtime=st.st_mtime, size=donor.size, probe=donor.probe,
+            content_hash=donor.content_hash, audio_fp=np.empty(0, np.uint32),
+            scene_cuts=np.empty(0, np.float32), lang_detected=None,
+            cam_score_partial=0.0, audio_coverage=None)
+
+    monkeypatch.setattr(analyze, "extract_cpu_features", fake_cpu)
+    monkeypatch.setattr(analyze, "extract_gpu_features",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("decode must be skipped")))
+    rec = analyze.analyze_file(str(moved), store, _StubEmbedder(), th)
+    assert rec.path == str(moved)
+    assert store.load(str(moved), with_embeddings=True) is not None    # the record followed the move
+    assert store.load("/gone/orig.mkv") is None                        # no orphan -> no self-duplicate
+    assert store.has_match("/gone/orig.mkv", "/other.mkv") is False    # edge dropped -> Pass-2 re-derives
     store.close()
 
 

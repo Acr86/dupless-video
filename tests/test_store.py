@@ -136,6 +136,21 @@ def test_problems_persistence_and_auto_cleanup(store):
     assert store.problems() == []
 
 
+def test_relocate_path_follows_a_moved_file(store):
+    """relocate_path renames a file across the store KEEPING its analysis: the record follows the new
+    path, the old path is gone (no self-duplicate orphan), and the file's match edges are dropped (the
+    next Pass-2 re-derives them)."""
+    store.save(_rec("/old.mkv"), feature_version=FV)
+    store.save(_rec("/other.mkv"), feature_version=FV)
+    store.save_match("/old.mkv", "/other.mkv", "CERTAIN", 0.99, "T1")
+    store.save_cluster(0, "/old.mkv", is_keep=True)
+    store.relocate_path("/old.mkv", "/new.mkv")
+    assert store.load("/new.mkv") is not None                      # record followed the path
+    assert store.load("/old.mkv") is None                          # no orphan left behind
+    assert store.has_match("/old.mkv", "/other.mkv") is False      # edges dropped -> re-derived on scan
+    assert "/old.mkv" not in store.all_paths()
+
+
 def test_delete_match_and_matched_pairs(store):
     """delete_match drops ONE pair (canonicalized, order-independent); matched_pairs is the small set of
     pairs that currently have a row (preloaded by the scan's delete-on-DIFFERENT guard)."""
