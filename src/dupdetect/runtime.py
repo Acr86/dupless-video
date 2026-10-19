@@ -119,7 +119,7 @@ def scan_in_progress() -> bool:
         try:
             p.unlink()
         except OSError:
-            pass
+            pass  # stale lock already gone or not removable: the dead PID makes it free either way
         return False
     return True
 
@@ -148,7 +148,7 @@ def set_viz(on: bool) -> None:
         try:
             p.unlink()
         except OSError:
-            pass
+            pass  # best-effort: signal file already absent (or locked) -> nothing more to clear
 
 
 @contextmanager
@@ -165,7 +165,7 @@ def scan_priority_lock():
         try:
             p.unlink()
         except OSError:
-            pass
+            pass  # best-effort cleanup: a leftover lock is self-healed later via its dead PID
 
 
 def os_key() -> str:

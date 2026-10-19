@@ -14,7 +14,7 @@ for _stream in (sys.stdout, sys.stderr):
     try:
         _stream.reconfigure(encoding="utf-8", errors="replace")
     except (AttributeError, ValueError):
-        pass
+        pass  # stream without reconfigure() (redirected/wrapped): keep its current encoding
 
 from dupdetect.config import load_thresholds
 from dupdetect.features.embeddings import Embedder

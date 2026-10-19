@@ -61,7 +61,7 @@ def selftest() -> int:
         try:
             os.remove(probe_db)
         except OSError:
-            pass
+            pass  # best-effort: a leftover probe DB in the temp dir is harmless
         lines.append("store schema init: OK (schema.sql found + applied)")
     except Exception as e:  # noqa: BLE001
         ok = False
@@ -90,7 +90,7 @@ def selftest() -> int:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(report, encoding="utf-8")
     except OSError:
-        pass
+        pass  # persisting the log is best-effort; the report was already printed
     return 0 if ok else 1
 
 

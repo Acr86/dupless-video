@@ -61,4 +61,4 @@ class EmbeddingCache:
             try:
                 self.get(p)
             except KeyError:
-                pass
+                pass  # no stored embedding for this path: nothing to preload

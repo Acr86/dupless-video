@@ -17,7 +17,7 @@ import time
 
 import numpy as np
 
-from dupdetect.align.video import _banded_matmul, banded_align
+from dupdetect.align import video as _v   # module ref: the DP gate below is toggled on the module
 
 GRID_S = 2.0          # resample_to_grid step (thresholds.yaml sampling.grid_step_s)
 BAND = 600            # band_radius frames = max_offset_s(300) * fps_sample(2)
@@ -43,7 +43,6 @@ def _best(fn):
 
 
 def main() -> None:
-    import dupdetect.align.video as _v
     has_fast = _v._banded_align_fast is not None
     print(f"band_radius={BAND} frames, D={D}, BLAS=1 thread, cython_DP={has_fast}\n")
     print(f"{'N':>6} {'runtime':>8} {'mm_full':>8} {'mm_band':>8} {'DP_pure':>8} {'DP_fast':>8} "
@@ -51,11 +50,11 @@ def main() -> None:
     for n in _NS:
         a, b = _rand_unit(n, 0), _rand_unit(n, 1)             # distinct seeds -> not a trivial diagonal
         t_mm, sim = _best(lambda a=a, b=b: a @ b.T)            # FULL matmul (today's worker path)
-        t_bmm, _ = _best(lambda a=a, b=b: _banded_matmul(a, b, BAND))   # 3a: band only (giants)
-        t_dp_fast, _ = _best(lambda sim=sim: banded_align(sim, BAND))   # 3b: Cython DP (if compiled)
+        t_bmm, _ = _best(lambda a=a, b=b: _v._banded_matmul(a, b, BAND))   # 3a: band only (giants)
+        t_dp_fast, _ = _best(lambda sim=sim: _v.banded_align(sim, BAND))   # 3b: Cython DP (if compiled)
         save = _v._banded_align_fast
         _v._banded_align_fast = None                          # force the pure-Python DP for baseline
-        t_dp_pure, _ = _best(lambda sim=sim: banded_align(sim, BAND))
+        t_dp_pure, _ = _best(lambda sim=sim: _v.banded_align(sim, BAND))
         _v._banded_align_fast = save
         before = t_mm + t_dp_pure                             # baseline: full matmul + pure-Python DP
         after = t_bmm + t_dp_fast                             # all levers: banded matmul + Cython DP

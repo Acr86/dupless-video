@@ -19,7 +19,8 @@ from dupdetect.runtime import app_data_dir, default_db_path
 DB = os.environ.get("DUPDETECT_DB") or str(default_db_path())
 CSV = os.environ.get("DUPDETECT_LABELS") or str(app_data_dir() / "labels.csv")
 
-rows = list(csv.DictReader(open(CSV, newline="", encoding="utf-8")))
+with open(CSV, newline="", encoding="utf-8") as fh:
+    rows = list(csv.DictReader(fh))
 th = load_thresholds()
 store = FingerprintStore(DB, init_schema=False)
 cache = EmbeddingCache(store)

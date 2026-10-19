@@ -92,7 +92,7 @@ def _run_ffmpeg_streaming(cmd: list[str], duration: float, timeout: int,
         try:
             proc.kill()
         except OSError:
-            pass
+            pass  # process already exited between the timeout and the kill
 
     timer = threading.Timer(timeout, _kill)
     timer.start()
@@ -123,11 +123,4 @@ def _unlink(p: Path) -> None:
     try:
         p.unlink(missing_ok=True)
     except OSError:
-        pass
-
-
-def _unlink(p: Path) -> None:
-    try:
-        p.unlink(missing_ok=True)
-    except OSError:
-        pass
+        pass  # best-effort cleanup of a temp file; never fail the repair over it

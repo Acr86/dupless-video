@@ -13,7 +13,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from dupdetect.align.video import _detect_superset, align_video, banded_align, resample_to_grid
+from dupdetect.align import video as v  # module ref: tests toggle its gates via monkeypatch
+from dupdetect.align.video import _detect_superset, align_video, resample_to_grid
 
 torch = pytest.importorskip("torch")
 
@@ -131,7 +132,7 @@ def test_banded_align_diagonal_path():
     # high similarity on the diagonal -> contiguous path i==j
     sim = torch.full((40, 40), 0.1)
     sim.fill_diagonal_(0.95)
-    path = banded_align(sim, band_radius=5)
+    path = v.banded_align(sim, band_radius=5)
     assert path is not None
     ia, ib = path[:, 0].tolist(), path[:, 1].tolist()
     assert ia == ib                                          # pure diagonal
@@ -140,7 +141,7 @@ def test_banded_align_diagonal_path():
 
 def test_banded_align_no_alignment_returns_none():
     sim = torch.full((30, 30), 0.1)                          # all below threshold 0.5
-    assert banded_align(sim, band_radius=5) is None
+    assert v.banded_align(sim, band_radius=5) is None
 
 
 # --------------------------------------------------------------- banded matmul (3a: giants) — §0
@@ -162,7 +163,6 @@ def test_banded_matmul_band_equals_full():
 def test_banded_align_fast_equals_pure(monkeypatch):
     """The compiled banded DP (Cython _fastdp) returns the IDENTICAL path to the pure-Python
     reference across many random shapes/bands -> verdict unchanged (§0). Skipped when not built."""
-    import dupdetect.align.video as v
     if v._banded_align_fast is None:
         pytest.skip("Cython _fastdp not compiled")
     fast_fn = v._banded_align_fast
@@ -176,9 +176,9 @@ def test_banded_align_fast_equals_pure(monkeypatch):
                     sim[i, min(i + int(rng.integers(-2, 3)), nb - 1)] += 2.0
         r = int(rng.integers(5, 80))
         monkeypatch.setattr(v, "_banded_align_fast", fast_fn)
-        fast = banded_align(sim, band_radius=r)
+        fast = v.banded_align(sim, band_radius=r)
         monkeypatch.setattr(v, "_banded_align_fast", None)   # force the pure-Python body
-        pure = banded_align(sim, band_radius=r)
+        pure = v.banded_align(sim, band_radius=r)
         assert (fast is None) == (pure is None)
         if fast is not None:
             assert np.array_equal(fast, pure)
@@ -188,7 +188,6 @@ def test_align_video_banded_matmul_matches_full(monkeypatch):
     """align_video's banded-matmul path (giants, numpy) yields the SAME AlignResult as the full
     matmul -> verdict invariant (§0). Force each path by moving the gate; numpy inputs so the banded
     branch runs (torch inputs go to the GPU full-matmul path). Scenario exercises offset + superset."""
-    import dupdetect.align.video as v
     film = list(range(600))
     a = VOCAB[np.array(film)]                                # numpy -> banded branch
     b = VOCAB[np.array(list(range(1500, 1510)) + film + list(range(1600, 1660)))]  # +10 offset, +60 tail
