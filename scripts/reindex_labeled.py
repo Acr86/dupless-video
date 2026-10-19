@@ -18,7 +18,8 @@ CSV = os.environ.get("DUPDETECT_LABELS") or str(app_data_dir() / "labels.csv")
 
 
 def main() -> None:
-    rows = list(csv.DictReader(open(CSV, newline="", encoding="utf-8")))
+    with open(CSV, newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
     files = sorted({r["path_a"] for r in rows} | {r["path_b"] for r in rows})
     present = [p for p in files if os.path.exists(p)]
     print(f"files in CSV: {len(files)} | exist on disk: {len(present)}")

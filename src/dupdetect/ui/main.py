@@ -1123,7 +1123,7 @@ class MainWindow(QMainWindow):
                 else:
                     subprocess.Popen(["xdg-open", folder])
             except OSError:
-                pass
+                pass  # no file manager available: opening the folder is a convenience, not an error
 
     def closeEvent(self, e):
         self._settings.setValue("watch_folder", self.watch_panel.folder.text().strip())

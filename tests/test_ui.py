@@ -34,12 +34,32 @@ def _isolate_qsettings(tmp_path_factory, monkeypatch):
     try:
         from PySide6.QtCore import QSettings
 
-        import dupdetect.ui.main as _m
+        from dupdetect.ui import main as _m
     except ImportError:
         return
     QSettings.setPath(QSettings.IniFormat, QSettings.UserScope, str(tmp_path_factory.mktemp("qset")))
     monkeypatch.setattr(_m, "QSettings", lambda *a, **k: QSettings(
         QSettings.IniFormat, QSettings.UserScope, "DuplessTest", "DuplessTest"))
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _qt_teardown():
+    """Destroy every top-level widget the UI tests left behind BEFORE the interpreter shuts down. Left
+    to garbage collection, a parentless panel (e.g. ScanPanel with its child QTimer) can outlive the
+    QApplication; PySide6 >= 6.12 then aborts at exit ("shared QObject was deleted directly") and the
+    pytest process segfaults (exit 139) even though every test passed. No-op without Qt."""
+    yield
+    try:
+        from PySide6.QtCore import QCoreApplication, QEvent
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        return
+    app = QApplication.instance()
+    if app is None:
+        return
+    for w in app.topLevelWidgets():
+        w.deleteLater()                         # no close(): avoids closeEvent side effects (prompts, saves)
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
 
 
 def test_clean_title_strips_release_tags():
@@ -165,9 +185,9 @@ def test_double_click_path_column_copies_full_path(tmp_path, monkeypatch):
     pytest.importorskip("PySide6")
     from PySide6.QtWidgets import QApplication
 
-    import dupdetect.ui.main as _m
     from dupdetect.config import load_thresholds
     from dupdetect.pipeline.fullscan import _rebuild_clusters
+    from dupdetect.ui import main as _m
     from dupdetect.ui.main import MainWindow
     monkeypatch.setattr(_m, "_mbox", lambda *a, **k: 0)
     monkeypatch.setattr(FingerprintStore, "prune_missing_files", lambda self: 0)
@@ -403,7 +423,7 @@ def test_refresh_with_prune_runs_in_background_and_reloads(tmp_path, monkeypatch
     pytest.importorskip("PySide6")
     from PySide6.QtWidgets import QApplication
 
-    import dupdetect.ui.main as _m
+    from dupdetect.ui import main as _m
     from dupdetect.ui.main import MainWindow
     # processEvents() below delivers EVERY pending zero-timer in the shared QApplication — including
     # the onboarding singleShots of MainWindows built by EARLIER tests (their bound _maybe_onboard was

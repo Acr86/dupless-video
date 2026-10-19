@@ -58,7 +58,7 @@ class Quality:
     audio_coverage: float | None = 1.0
     # Color signals (latest stage): clipping is the objective KEEP signal (less = more detail
     # preserved); cast/saturation/contrast describe the grade -> only flag 'color differs'.
-    color: ColorStats = field(default_factory=lambda: ColorStats())
+    color: ColorStats = field(default_factory=ColorStats)
 
 
 @dataclass

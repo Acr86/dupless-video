@@ -545,7 +545,7 @@ def test_full_scan_empty_dir(th, store, tmp_path):
 def test_full_scan_no_match_skips_pass2(th, store, tmp_path, monkeypatch):
     """`match=False` -> Pass-1 only: matching (and the coarse index) are NOT run. Lets a large
     library be (re)indexed cheaply before the O(N^2) Pass-2."""
-    import dupdetect.pipeline.fullscan as fs
+    from dupdetect.pipeline import fullscan as fs
 
     def _boom(*a, **k):
         raise AssertionError("Pass-2 must not run when match=False")

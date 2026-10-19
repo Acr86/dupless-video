@@ -743,7 +743,7 @@ class FingerprintStore:
             try:
                 self._emb_file(row["emb_path"]).unlink(missing_ok=True)
             except OSError:
-                pass
+                pass  # best-effort: an orphaned .npy is harmless; deleting the row below is what matters
         self.conn.execute("DELETE FROM files WHERE path=?", (str(path),))
         self.conn.execute("DELETE FROM matches WHERE a_path=? OR b_path=?", (str(path), str(path)))
         self.conn.execute("DELETE FROM clusters WHERE path=?", (str(path),))
@@ -825,7 +825,7 @@ def _is_mount(path: str) -> bool:
         if os.path.ismount(path):
             return True
     except OSError:
-        pass
+        pass  # unreadable path: fall through to the junction check below
     try:
         return Path(path).is_junction()                   # Python 3.12+
     except (OSError, AttributeError):

@@ -165,7 +165,7 @@ def _no_align(*_a, **_k):
 
 def test_labeled_from_feedback_uses_matches_json(store, th, monkeypatch):
     """Pair with a row in `matches`: reuses its JSON scores WITHOUT recomputing (does not call _align_pair)."""
-    import dupdetect.pipeline.calibrate as cal
+    from dupdetect.pipeline import calibrate as cal
     monkeypatch.setattr(cal, "_align_pair", _no_align)   # if called, the fast path failed
     aj = json.dumps(asdict(AlignResult(0.9)))
     store.save_match("/a", "/b", "CERTAIN", 0.99, "T1", audio_json=aj, video_json=aj, scenes_json=aj)
@@ -178,7 +178,7 @@ def test_labeled_from_feedback_uses_matches_json(store, th, monkeypatch):
 def test_labeled_from_feedback_recomputes_orphan(store, th, monkeypatch):
     """ORPHAN pair (feedback but NO row in matches): recovered by recomputing from stored
     fingerprints. _align_pair is mocked to avoid depending on torch/real embeddings."""
-    import dupdetect.pipeline.calibrate as cal
+    from dupdetect.pipeline import calibrate as cal
     store.save(_rec("/a"), feature_version="fv")
     store.save(_rec("/b"), feature_version="fv")
     store.save_feedback("/a", "/b", "same")              # canonical (/a,/b); NO save_match
@@ -192,7 +192,7 @@ def test_labeled_from_feedback_recomputes_orphan(store, th, monkeypatch):
 
 def test_labeled_from_feedback_skips_missing_fingerprint(store, th, monkeypatch):
     """Endpoint with no record in `files` -> the pair is SKIPPED (None), no exception."""
-    import dupdetect.pipeline.calibrate as cal
+    from dupdetect.pipeline import calibrate as cal
     store.save(_rec("/a"), feature_version="fv")         # /b does NOT exist in files
     store.save_feedback("/a", "/b", "same")
     monkeypatch.setattr(cal, "_align_pair", _no_align)   # must not align without both records
@@ -203,7 +203,7 @@ def test_labeled_from_feedback_skips_missing_fingerprint(store, th, monkeypatch)
 def test_labeled_from_feedback_skips_lite_without_embeddings(store, th, monkeypatch):
     """LITE / 'exact-only' records (no fingerprints) -> UNRECOVERABLE: a signal with score 0 is NOT
     fabricated (would poison calibration). Skipped -> user must re-scan (full)."""
-    import dupdetect.pipeline.calibrate as cal
+    from dupdetect.pipeline import calibrate as cal
     for p in ("/a", "/b"):
         lite = _rec(p)
         lite.embeddings = np.zeros((0, 0), np.float16)   # no embeddings (like an exact-scan)
@@ -237,7 +237,7 @@ def test_apply_thresholds_frozen_writes_user_override(tmp_path, monkeypatch):
     OVERRIDE in the data dir (not crash with WinError 5), and load_thresholds then prefers it."""
     from pathlib import Path
 
-    import dupdetect.config as cfg
+    from dupdetect import config as cfg
     from dupdetect.ui import actions
     override = tmp_path / "thresholds.yaml"
     monkeypatch.setattr(cfg, "user_thresholds_path", lambda: override)

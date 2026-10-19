@@ -19,7 +19,7 @@ av = pytest.importorskip("av")
 def test_align_scenes_fast_equals_pure(monkeypatch):
     """The compiled DTW fill (Cython _fastdp) yields the IDENTICAL score to the pure-Python
     reference across many random cut signatures -> verdict unchanged (§0). Skipped when not built."""
-    import dupdetect.align.scenes as s
+    from dupdetect.align import scenes as s
     if s._scenes_dtw_final is None:
         pytest.skip("Cython _fastdp not compiled")
     fast_fn = s._scenes_dtw_final
