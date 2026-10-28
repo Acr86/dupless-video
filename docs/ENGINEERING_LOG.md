@@ -11,6 +11,23 @@ Newest on top. Append-only in spirit. Deep rationale for the design invariants l
 
 ## Entries
 
+### Scanning another folder hides what the previous scan found (Fast / exact-only depth)
+- **Symptom:** scan folder A, then scan folder B with the same DB → A's duplicate groups vanish from
+  the Duplicates tab; only B's groups remain.
+- **Root cause:** `exact_scan` → `_build_exact_clusters` called `store.replace_clusters(rows)` with ONLY
+  this run's hash groups — a full-table replace scoped to the run's targets. It violated A5 (clusters are
+  a derived view of the GLOBAL `matches` graph). Standard/Deep (`full_scan` → `_rebuild_clusters`) were
+  already global, so only Fast mode (UI "Fast — byte-identical only", CLI `--depth fast`/`--exact-only`,
+  and the watcher's `--exact-first` sweep) lost results. Data was never deleted: the T0 `matches` rows
+  survived, so any Standard scan / rebuild brought the groups back.
+- **Resolution:** keep stamping T0 matches and ranking this run's groups (the report still covers only
+  this run), then persist via `_rebuild_clusters(store, th, reuse=...)` — global + atomic. `reuse` =
+  snapshot of the existing table + this run's fresh rankings, so earlier groups are NOT re-ranked (no
+  whisper/audio re-run). Side effect: Fast mode now honors user "not a duplicate" vetoes like the rest.
+- **Files/refs:** `pipeline/fullscan.py::_build_exact_clusters`;
+  test `test_fullscan.test_exact_scan_of_another_folder_keeps_prior_clusters`.
+- **Scope:** fixed 2026-10-28 (after 0.1.5; affects every released version incl. 0.1.3).
+
 ### Same library under two mounts (PC M:\ vs NAS /share) — one record follows the active mount
 - **Need:** the library moved to a NAS; the user wants the SAME DB usable under both the PC's `M:\`
   mount and a NAS `/share` path, sharing the analysis, without re-scanning and without the same file
