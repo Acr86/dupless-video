@@ -388,6 +388,41 @@ def test_exact_scan_detects_byte_identical_files(th, store, tmp_path):
     assert len(rep2["clusters"]) == 1
 
 
+def test_exact_scan_of_another_folder_keeps_prior_clusters(th, store, tmp_path):
+    """Clusters are a derived view of the GLOBAL `matches` graph (A5), not of this run's targets.
+    Scanning folder A, then folder B, must leave A's group in the duplicates list — exact_scan used
+    to replace the whole table with ONLY B's hash groups, wiping every earlier result."""
+    import shutil
+
+    av = pytest.importorskip("av")
+
+    def _mk(p, val):
+        c = av.open(str(p), "w"); s = c.add_stream("mpeg4", rate=10)
+        s.width = s.height = 64; s.pix_fmt = "yuv420p"
+        for _ in range(10):
+            fr = av.VideoFrame.from_ndarray(np.full((64, 64, 3), val, np.uint8),
+                                            format="rgb24").reformat(format="yuv420p")
+            for pk in s.encode(fr):
+                c.mux(pk)
+        for pk in s.encode():
+            c.mux(pk)
+        c.close()
+
+    fa, fb = tmp_path / "A", tmp_path / "B"
+    fa.mkdir(); fb.mkdir()
+    a1 = fa / "a1.mp4"; _mk(a1, 50); a2 = fa / "a2.mp4"; shutil.copyfile(a1, a2)
+    b1 = fb / "b1.mp4"; _mk(b1, 200); b2 = fb / "b2.mp4"; shutil.copyfile(b1, b2)
+
+    exact_scan([str(fa)], store, th, workers=1, recursive=True)
+    rep = exact_scan([str(fb)], store, th, workers=1, recursive=True)
+    assert len(rep["clusters"]) == 1                      # the report still covers THIS run only
+    groups: dict = {}
+    for r in store.conn.execute("SELECT cluster_id, path FROM clusters"):
+        groups.setdefault(r["cluster_id"], set()).add(r["path"])
+    assert sorted(map(sorted, groups.values())) == sorted([sorted([str(a1), str(a2)]),
+                                                           sorted([str(b1), str(b2)])])
+
+
 # --------------------------------------------------------- apply_thresholds_to_store
 
 def test_apply_thresholds_to_store_redecides_from_stored_signals(th, store):

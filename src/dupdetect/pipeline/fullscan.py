@@ -631,20 +631,25 @@ def _build_exact_clusters(by_hash, store, th) -> list[dict]:
     the two tables drifted (ui.data.drift_report). Members share (hash, size) -> the T0 tier holds by
     construction. Star topology (a representative linked to every other copy) is O(N); skip a pair
     that already carries a content verdict so a prior full-scan T1 is not clobbered (mirrors the
-    has_match rule)."""
+    has_match rule).
+
+    The PERSISTED table is then rebuilt from the GLOBAL `matches` graph (A5), not from this run's
+    hash groups alone: replacing it with only `by_hash` wiped every cluster found by an earlier scan
+    of OTHER folders. Earlier groups reuse their stored ranking (no whisper/audio re-run); the
+    returned list still reports only this run's byte-identical groups."""
     groups = [v for _, v in by_hash.items() if len(v) > 1]
-    rows, clusters_out = [], []
+    reuse = _snapshot_clusters(store)                    # earlier results keep their KEEP/rank_reason
+    clusters_out = []
     for members in groups:
         cid = _stable_cluster_id(members)                # stable, content-derived: no cross-rebuild fusion
         ranked = rank_cluster(members, store, th)        # identical copies: arbitrary keep, ok
-        for m in members:
-            rows.append((cid, m, m == ranked["keep"], ranked["evidence"].get(m, "")))
+        reuse[frozenset(members)] = (ranked["keep"], ranked["evidence"])   # rebuild won't re-rank it
         hub = ranked["keep"] or members[0]
         for m in members:
             if m != hub and not store.has_match(hub, m):
                 store.save_match(hub, m, Verdict.CERTAIN.value, 1.00, T0_REASON)
         clusters_out.append({"cluster_id": cid, **ranked})
-    store.replace_clusters(rows)                         # atomic full replace (no interleave with a rebuild)
+    _rebuild_clusters(store, th, reuse=reuse)            # global + atomic (replace_clusters inside)
     return clusters_out
 
 
