@@ -1,13 +1,16 @@
-"""UI actions: open in VLC and delete files (always to the system Trash — recoverable).
+"""UI actions: open in VLC and delete files (to the system Trash; PERMANENT on a Windows network
+drive, which has no Recycle Bin — the UI confirms that explicitly).
 Logic separated from Qt to keep it testable. KEEP never reaches here (filtered by the model)."""
 from __future__ import annotations
 
 import os
 import shutil
 import subprocess
-from dataclasses import dataclass
+import sys
+from dataclasses import dataclass, field
 
 from dupdetect.store import FingerprintStore
+from dupdetect.store.store import _is_mount, _missing_on_online_volume
 
 
 def find_vlc() -> str | None:
@@ -97,38 +100,94 @@ def web_search(query: str) -> None:
         webbrowser.open(url)                             # no private mode: no browser detected
 
 
+_DRIVE_REMOTE = 4                                       # GetDriveTypeW: a mapped network drive
+
+
+def _drive_type(root: str) -> int:
+    """Windows GetDriveTypeW for a drive root like 'M:\\' (isolated so tests can fake it)."""
+    import ctypes
+    return ctypes.windll.kernel32.GetDriveTypeW(root)
+
+
+def is_network_path(path: str) -> bool:
+    """True if `path` lives on a UNC share or a MAPPED NETWORK DRIVE. Windows has NO Recycle Bin
+    there: send2trash's shell call deletes such a file PERMANENTLY (measured on a mapped NAS drive:
+    gone, not in the Recycle Bin) — so the UI must warn and get an explicit acknowledgement. Detected
+    from the OS (drive type), never from the path's look: a drive letter can map anywhere.
+    Non-Windows -> False (the XDG/macOS Trash handles other mounts)."""
+    if sys.platform != "win32":
+        return False
+    p = path.replace("/", "\\")
+    if p.startswith("\\\\?\\"):                         # long-path form: \\?\UNC\srv\share or \\?\C:\...
+        p = p[4:]
+        if p.upper().startswith("UNC\\"):
+            return True
+    elif p.startswith("\\\\"):
+        return True                                     # plain UNC \\server\share\...
+    if len(p) >= 2 and p[1] == ":":
+        try:
+            return _drive_type(p[0] + ":\\") == _DRIVE_REMOTE
+        except Exception:                               # noqa: BLE001 — no kernel32: treat as local
+            return False
+    return False
+
+
 @dataclass
 class DeleteResult:
     deleted: list[str]
     errors: list[tuple[str, str]]                       # (path, message)
     freed_bytes: int
+    already_gone: list[str] = field(default_factory=list)   # listed, but already gone from disk
 
 
-def delete_files(store: FingerprintStore, files: list[tuple[str, int]]) -> DeleteResult:
+def _really_gone(path: str, exists) -> bool:
+    """Is `path` gone from an ONLINE volume (a real deletion, not an offline NAS)? Same fail-safe
+    guard as prune_missing_files, so a disconnected drive never reads as 'already deleted'."""
+    return bool(_missing_on_online_volume([path], exists, os.path.isdir, _is_mount))
+
+
+def delete_files(store: FingerprintStore, files: list[tuple[str, int]], *,
+                 exists=os.path.exists) -> DeleteResult:
     """Sends `files` = [(path, size)] to the system Trash (Recycle Bin on Windows, XDG Trash on
-    Linux, Trash on macOS) via send2trash — ALWAYS recoverable; this app never deletes permanently
-    (a dedupe tool must not be a one-click way to lose a file). After each: audits it
+    Linux, Trash on macOS) via send2trash. On a local drive that is recoverable; on a Windows NETWORK
+    drive there is no Recycle Bin and the shell deletes PERMANENTLY — the UI confirms that explicitly
+    (`is_network_path`) and the audit row says 'permanent', never 'trash'. After each: audits it
     (`record_deletion`) and REMOVES it from the index (`forget_file`: row + matches + cluster + .npy)
-    so no ghost lingers. Must NEVER receive a KEEP (the model blocks it)."""
+    so no ghost lingers. Must NEVER receive a KEEP (the model blocks it).
+
+    A file already gone from an online volume is forgotten as `already_gone` (no error, no audit: we
+    didn't delete it). A send2trash error after which the file is gone counts as deleted — otherwise
+    its row stayed and every retry failed with "[Errno 2] ... '\\\\?\\M:\\...'" (send2trash's
+    long-path form). `exists` is injectable for the offline-volume guard in tests."""
     from send2trash import send2trash
 
     deleted: list[str] = []
     errors: list[tuple[str, str]] = []
+    gone_before: list[str] = []
     freed = 0
     for path, size in files:
+        if not exists(path) and _really_gone(path, exists):
+            store.forget_file(path)
+            gone_before.append(path)
+            continue
         try:
             send2trash(os.path.normpath(path))
-            store.record_deletion(path, "trash", size)
+        except Exception as e:                          # noqa: BLE001
+            if not _really_gone(path, exists):          # still there, or the volume is offline
+                errors.append((path, str(e)))
+                continue
+        try:
+            store.record_deletion(path, "permanent" if is_network_path(path) else "trash", size)
             store.forget_file(path)
             deleted.append(path)
             freed += int(size or 0)
         except Exception as e:                          # noqa: BLE001
             errors.append((path, str(e)))
-    if deleted:
+    if deleted or gone_before:
         # A cluster left with 1 file is no longer a duplicate group: prune it so
         # it does not appear in the list (the remaining keep is intact in `files` and on disk).
         store.prune_singleton_clusters()
-    return DeleteResult(deleted=deleted, errors=errors, freed_bytes=freed)
+    return DeleteResult(deleted=deleted, errors=errors, freed_bytes=freed, already_gone=gone_before)
 
 
 def apply_thresholds(theta_v: float, theta_a: float, config_path: str | None = None,
