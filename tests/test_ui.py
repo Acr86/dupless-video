@@ -334,6 +334,30 @@ def test_smoke_gui_offscreen(store, monkeypatch):
     assert len(checked_files(m)) == 1                     # only non-keep (KEEP is locked)
 
 
+def test_confirm_delete_requires_ack_for_network_files(monkeypatch):
+    """Windows has NO Recycle Bin on a network drive: the confirm dialog must say the deletion there is
+    PERMANENT and keep the OK button disabled until the user explicitly acknowledges it. Local-only
+    selections keep the plain Recycle Bin confirm (no extra step)."""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication, QDialogButtonBox
+
+    from dupdetect.ui import actions, main
+    QApplication.instance() or QApplication([])
+    monkeypatch.setattr(actions, "is_network_path", lambda p: p.startswith("M:"))
+
+    dlg = main._ConfirmDelete(None, [(r"M:\a.mp4", 10), (r"L:\b.mp4", 10)])
+    ok = dlg.findChild(QDialogButtonBox).button(QDialogButtonBox.Ok)
+    assert not ok.isEnabled()                             # blocked until acknowledged
+    assert "PERMANENTLY" in ok.text()
+    dlg._ack.setChecked(True)
+    assert ok.isEnabled()
+
+    local = main._ConfirmDelete(None, [(r"L:\b.mp4", 10)])
+    assert local._ack is None
+    assert local.findChild(QDialogButtonBox).button(QDialogButtonBox.Ok).isEnabled()
+
+
 def test_build_model_preserves_selection(store, monkeypatch):
     """Rebuilding the tree (e.g. after 'Set as master') must preserve checked state:
     paths in `checked` remain checked; other non-keep entries are unchecked."""

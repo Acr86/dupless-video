@@ -11,6 +11,30 @@ Newest on top. Append-only in spirit. Deep rationale for the design invariants l
 
 ## Entries
 
+### Delete fails with "[Errno 2] ... '\\?\M:\...'" (looks like a wrong path) — and NAS deletes were PERMANENT
+- **Symptom:** deleting from the Duplicates tab errors with a path like `'\\\\?\\M:\\Adult\\...'`; the
+  user read it as "it's looking in another path / a weird mapping". DB on a mapped NAS drive (`M:` →
+  `\\<nas>\Media`).
+- **Root cause (two):** (1) the mapping was fine (all rows `M:\...`). send2trash's legacy backend
+  rewrites every path to the long-path form `\\?\M:\...` (and, on Samba, to 8.3 mangled names like
+  `_O8S8A~F\SKUUHX~D`) — so a file ALREADY GONE from disk fails with that odd-looking path, on every
+  retry. The user's DB had 5 such ghost rows (non-KEEP, KEEP intact) and 0 `deletions` rows: the bytes
+  had been removed but the row was never forgotten. (2) Windows has NO Recycle Bin on a network drive:
+  measured — a probe send2trash'ed on `L:` landed in the Recycle Bin, the same on `M:` was PERMANENTLY
+  deleted, silently, while the app promised "always recoverable".
+- **Resolution:** `actions.delete_files` forgets a file already gone from an ONLINE volume
+  (`already_gone`, no error, no audit row; same fail-safe guard as `prune_missing_files`, so an offline
+  NAS never reads as deleted), and counts a send2trash error after which the file is gone as deleted.
+  User chose option B for network drives: `is_network_path` (GetDriveTypeW == DRIVE_REMOTE, or UNC —
+  from the OS, never the path's look) → the confirm dialog warns in red, tags rows `[PERMANENT]`, and
+  keeps OK disabled until an explicit "I understand" checkbox; the audit row says `permanent`, not
+  `trash`. Rejected alternatives: a share-local `.dupless-trash` folder, relying on the NAS recycle bin.
+- **Files/refs:** `ui/actions.py` (`is_network_path`, `_really_gone`, `delete_files`),
+  `ui/main.py::_ConfirmDelete`; tests `test_delete_prune.py` (5 new), `test_ui.py::
+  test_confirm_delete_requires_ack_for_network_files`.
+- **Scope:** fixed 2026-10-29 (0.1.7). SQLite in WAL mode on an SMB share is outside SQLite's supported
+  setup (WAL needs shared memory) — not the cause here, noted as a latent risk.
+
 ### Scanning another folder hides what the previous scan found (Fast / exact-only depth)
 - **Symptom:** scan folder A, then scan folder B with the same DB → A's duplicate groups vanish from
   the Duplicates tab; only B's groups remain.

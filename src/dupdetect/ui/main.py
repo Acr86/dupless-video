@@ -12,6 +12,7 @@ from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -815,6 +816,8 @@ class MainWindow(QMainWindow):
             return
         res = actions.delete_files(self.store, files)
         msg = f"Deleted {len(res.deleted)} · freed {_gb(res.freed_bytes)}"
+        if res.already_gone:
+            msg += f"\n{len(res.already_gone)} already gone from disk — removed from the list"
         if res.errors:
             msg += f"\n{len(res.errors)} errors:\n" + "\n".join(f"· {p}: {e}" for p, e in res.errors[:8])
         self._toast(msg)                                 # silent, non-modal
@@ -823,8 +826,8 @@ class MainWindow(QMainWindow):
         # by a background full-scan rebuilding clusters on the same DB. forget_file already persisted
         # the removal (stat-guarded so the scan can't resurrect it); this only reconciles the VIEW,
         # avoiding a load_clusters round-trip that could race the scan's mid-flight cluster rebuild.
-        if res.deleted:
-            remove_paths(self.model, set(res.deleted))
+        if res.deleted or res.already_gone:
+            remove_paths(self.model, set(res.deleted) | set(res.already_gone))
             self._update_sel()
             self._update_coverage()
         else:
@@ -1159,23 +1162,42 @@ def _mbox(parent, title: str, text: str, buttons=QMessageBox.Ok, default=QMessag
 
 
 class _ConfirmDelete(QDialog):
-    """Confirmation dialog: lists what will be sent to the Trash + total. Deletion is ALWAYS to the
-    system Trash (Recycle Bin) — recoverable; there is no permanent option (a dedupe tool must not be
-    a one-click way to lose a file)."""
+    """Confirmation dialog: lists what will be deleted + total. Local files go to the system Trash
+    (Recycle Bin) — recoverable. Windows has NO Recycle Bin on a network drive, so files there are
+    deleted PERMANENTLY: the dialog says so, marks them, and keeps OK disabled until the user ticks an
+    explicit acknowledgement (a dedupe tool must not be a one-click way to lose a file). `_ack` is
+    None when nothing is on a network drive (plain confirm, no extra step)."""
     def __init__(self, parent, files: list[tuple[str, int]]):
         super().__init__(parent)
         self.setWindowTitle("Confirm deletion")
         self.resize(720, 420)
         total = sum(s for _, s in files)
+        net = {p for p, _ in files if actions.is_network_path(p)}
         lay = QVBoxLayout(self)
-        lay.addWidget(QLabel(f"Send {len(files)} file(s) · {_gb(total)} to the Recycle Bin?  "
-                             "The KEEP ★ are NOT touched — you can restore these from the Trash."))
+        lay.addWidget(QLabel(f"Delete {len(files)} file(s) · {_gb(total)}?  The KEEP ★ are NOT touched."
+                             + ("" if len(net) == len(files)
+                                else "  Local files go to the Recycle Bin (restorable).")))
+        self._ack = None
+        if net:
+            warn = QLabel(f"⚠ {len(net)} file(s) are on a NETWORK drive. Windows has no Recycle Bin "
+                          "there: they will be PERMANENTLY deleted and cannot be restored.")
+            warn.setWordWrap(True)
+            warn.setStyleSheet("color: #c62828; font-weight: bold;")
+            lay.addWidget(warn)
         lst = QListWidget()
         for path, size in files:
-            lst.addItem(f"{_gb(size):>9}   {path}")
+            lst.addItem(f"{_gb(size):>9}   {'[PERMANENT] ' if path in net else ''}{path}")
         lay.addWidget(lst)
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        bb.button(QDialogButtonBox.Ok).setText(f"Send {len(files)} to Recycle Bin")
+        ok = bb.button(QDialogButtonBox.Ok)
+        if net:
+            self._ack = QCheckBox(f"I understand: {len(net)} network file(s) will be permanently deleted")
+            ok.setText(f"Delete {len(files)} ({len(net)} PERMANENTLY)")
+            ok.setEnabled(False)
+            self._ack.toggled.connect(ok.setEnabled)
+            lay.addWidget(self._ack)
+        else:
+            ok.setText(f"Send {len(files)} to Recycle Bin")
         bb.accepted.connect(self.accept); bb.rejected.connect(self.reject)
         lay.addWidget(bb)
 
