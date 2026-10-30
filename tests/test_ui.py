@@ -192,7 +192,7 @@ def test_double_click_path_column_copies_full_path(tmp_path, monkeypatch):
     monkeypatch.setattr(_m, "_mbox", lambda *a, **k: 0)
     monkeypatch.setattr(FingerprintStore, "prune_missing_files", lambda self: 0)
     opened: list[str] = []
-    monkeypatch.setattr(_m.actions, "open_in_vlc", lambda p: opened.append(p))
+    monkeypatch.setattr(_m.actions, "open_in_vlc", opened.append)
 
     db = tmp_path / "dc.sqlite"
     st = FingerprintStore(db)
@@ -205,7 +205,7 @@ def test_double_click_path_column_copies_full_path(tmp_path, monkeypatch):
     QApplication.instance() or QApplication([])
     w = MainWindow(str(db))
     copied: list[str] = []
-    monkeypatch.setattr(w, "_copy_path", lambda p: copied.append(p))
+    monkeypatch.setattr(w, "_copy_path", copied.append)
     file_item = w.model.invisibleRootItem().child(0).child(0)     # first file under the first cluster
     base = w.model.indexFromItem(file_item)
     headers = [w.model.horizontalHeaderItem(c).text() for c in range(w.model.columnCount())]

@@ -130,7 +130,7 @@ def test_delete_files_audits_network_deletion_as_permanent(tmp_path, monkeypatch
     from dupdetect.ui import actions
 
     s, keep, disc = _pair(tmp_path)
-    monkeypatch.setattr("send2trash.send2trash", lambda p: os.remove(p))
+    monkeypatch.setattr("send2trash.send2trash", os.remove)
     monkeypatch.setattr(actions, "is_network_path", lambda p: True)
     res = actions.delete_files(s, [(str(disc), 10)])
     assert res.deleted == [str(disc)]
